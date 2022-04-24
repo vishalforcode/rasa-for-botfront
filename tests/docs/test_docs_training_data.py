@@ -14,10 +14,17 @@ from rasa.shared.constants import DOMAIN_SCHEMA_FILE
 
 DOCS_BASE_DIR = Path("docs/")
 MDX_DOCS_FILES = list((DOCS_BASE_DIR / "docs").glob("**/*.mdx"))
+
+# Exclude the migration guide from this check as the migration guide might
+# contain training data which once was valid but is not valid anymore.
+# E.g. the migration guide for Rasa Open Source 2 defined a form schema which
+# is no longer valid since Rasa Open Source 3.
+MDX_DOCS_FILES.remove(Path("docs/docs/migration-guide.mdx"))
+
 # we're matching codeblocks with either `yaml-rasa` or `yml-rasa` types
 # we support title or no title (you'll get a nice error message if there is a title)
 TRAINING_DATA_CODEBLOCK_RE = re.compile(
-    r"```y(?:a)?ml-rasa(?: title=[\"'][^\"']+[\"'])?(?: \((?P<yaml_path>.+?)\))?[^\n]*\n(?P<codeblock>.*?)```",
+    r"```y(?:a)?ml-rasa(?: title=[\"'][^\"']+[\"'])?(?: \((?P<yaml_path>.+?)\))?[^\n]*\n(?P<codeblock>.*?)```",  # noqa: E501
     re.DOTALL,
 )
 
@@ -41,7 +48,8 @@ def test_docs_training_data(mdx_file_path: Path):
         start_index = match.span()[0]
         line_number = mdx_content.count("\n", 0, start_index) + 1
 
-        # the responses schema is automatically checked in validate_yaml_schema, don't need to add it here
+        # the responses schema is automatically checked in validate_yaml_schema,
+        # don't need to add it here
         schemas_to_try = [NLU_SCHEMA_FILE, CORE_SCHEMA_FILE, DOMAIN_SCHEMA_FILE]
         for schema in schemas_to_try:
             try:

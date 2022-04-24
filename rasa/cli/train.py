@@ -7,6 +7,8 @@ from rasa.cli import SubParsersAction
 import rasa.cli.arguments.train as train_arguments
 
 import rasa.cli.utils
+import rasa.utils.common
+from rasa.core.train import do_compare_training
 from rasa.shared.utils.cli import print_error
 from rasa.shared.constants import (
     CONFIG_MANDATORY_KEYS_CORE,
@@ -16,7 +18,6 @@ from rasa.shared.constants import (
     DEFAULT_DOMAIN_PATH,
     DEFAULT_DATA_PATH,
 )
-import rasa.utils.common
 
 
 def add_subparser(
@@ -45,7 +46,7 @@ def add_subparser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         help="Trains a Rasa Core model using your stories.",
     )
-    train_core_parser.set_defaults(func=train_core)
+    train_core_parser.set_defaults(func=run_core_training)
 
     train_nlu_parser = train_subparsers.add_parser(
         "nlu",
@@ -53,15 +54,15 @@ def add_subparser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         help="Trains a Rasa NLU model using your NLU data.",
     )
-    train_nlu_parser.set_defaults(func=train_nlu)
+    train_nlu_parser.set_defaults(func=run_nlu_training)
 
-    train_parser.set_defaults(func=lambda args: train(args, can_exit=True))
+    train_parser.set_defaults(func=lambda args: run_training(args, can_exit=True))
 
     train_arguments.set_train_core_arguments(train_core_parser)
     train_arguments.set_train_nlu_arguments(train_nlu_parser)
 
 
-def train(args: argparse.Namespace, can_exit: bool = False) -> Optional[Text]:
+def run_training(args: argparse.Namespace, can_exit: bool = False) -> Optional[Text]:
     """Trains a model.
 
     Args:
@@ -72,26 +73,13 @@ def train(args: argparse.Namespace, can_exit: bool = False) -> Optional[Text]:
     Returns:
         Path to a trained model or `None` if training was not successful.
     """
-    import rasa
+    from rasa import train as train_all
 
     domain = rasa.cli.utils.get_validated_path(
         args.domain, "domain", DEFAULT_DOMAIN_PATH, none_is_valid=True
     )
 
-    # bf
-    if os.path.isdir(args.config):
-        from rasa.telemetry import TELEMETRY_ENABLED_ENVIRONMENT_VARIABLE
-        from pathlib import Path
-
-        os.environ[TELEMETRY_ENABLED_ENVIRONMENT_VARIABLE] = "false"
-        config = [
-            Path(args.config) / f
-            for f in os.listdir(args.config)
-            if f.startswith("config") and f.endswith(("yml", "yaml"))
-        ]
-    else:
-        config = _get_valid_config(args.config, CONFIG_MANDATORY_KEYS)
-    # /bf
+    config = _get_valid_config(args.config, CONFIG_MANDATORY_KEYS)
 
     training_files = [
         rasa.cli.utils.get_validated_path(
@@ -100,7 +88,7 @@ def train(args: argparse.Namespace, can_exit: bool = False) -> Optional[Text]:
         for f in args.data
     ]
 
-    training_result = rasa.train(
+    training_result = train_all(
         domain=domain,
         config=config,
         training_files=training_files,
@@ -130,21 +118,16 @@ def _model_for_finetuning(args: argparse.Namespace) -> Optional[Text]:
         return args.finetune
 
 
-def train_core(
-    args: argparse.Namespace, train_path: Optional[Text] = None
-) -> Optional[Text]:
+def run_core_training(args: argparse.Namespace) -> Optional[Text]:
     """Trains a Rasa Core model only.
 
     Args:
         args: Command-line arguments to configure training.
-        train_path: Path where trained model but not unzipped model should be stored.
 
     Returns:
         Path to a trained model or `None` if training was not successful.
     """
-    from rasa.train import train_core
-
-    output = train_path or args.out
+    from rasa.model_training import train_core
 
     args.domain = rasa.cli.utils.get_validated_path(
         args.domain, "domain", DEFAULT_DOMAIN_PATH, none_is_valid=True
@@ -166,36 +149,27 @@ def train_core(
             domain=args.domain,
             config=config,
             stories=story_file,
-            output=output,
-            train_path=train_path,
+            output=args.out,
             fixed_model_name=args.fixed_model_name,
             additional_arguments=additional_arguments,
             model_to_finetune=_model_for_finetuning(args),
             finetuning_epoch_fraction=args.epoch_fraction,
         )
     else:
-        from rasa.core.train import do_compare_training
-
-        rasa.utils.common.run_in_loop(
-            do_compare_training(args, story_file, additional_arguments)
-        )
+        do_compare_training(args, story_file, additional_arguments)
+        return None
 
 
-def train_nlu(
-    args: argparse.Namespace, train_path: Optional[Text] = None
-) -> Optional[Text]:
+def run_nlu_training(args: argparse.Namespace) -> Optional[Text]:
     """Trains an NLU model.
 
     Args:
         args: Namespace arguments.
-        train_path: Directory where models should be stored.
 
     Returns:
         Path to a trained model or `None` if training was not successful.
     """
-    from rasa.train import train_nlu
-
-    output = train_path or args.out
+    from rasa.model_training import train_nlu
 
     config = _get_valid_config(args.config, CONFIG_MANDATORY_KEYS_NLU)
     nlu_data = rasa.cli.utils.get_validated_path(
@@ -210,8 +184,7 @@ def train_nlu(
     return train_nlu(
         config=config,
         nlu_data=nlu_data,
-        output=output,
-        train_path=train_path,
+        output=args.out,
         fixed_model_name=args.fixed_model_name,
         persist_nlu_training_data=args.persist_nlu_data,
         additional_arguments=extract_nlu_additional_arguments(args),
@@ -259,7 +232,7 @@ def _get_valid_config(
     """
     config = rasa.cli.utils.get_validated_path(config, "config", default_config)
 
-    if not os.path.exists(config):
+    if not config or not os.path.exists(config):
         print_error(
             "The config file '{}' does not exist. Use '--config' to specify a "
             "valid config file."

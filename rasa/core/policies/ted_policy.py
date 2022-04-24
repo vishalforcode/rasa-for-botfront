@@ -1,32 +1,31 @@
+from __future__ import annotations
 import logging
+
+from rasa.engine.recipes.default_recipe import DefaultV1Recipe
 from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
-
-import rasa.shared.utils.io
 import tensorflow as tf
-import tensorflow_addons as tfa
-from typing import Any, List, Optional, Text, Dict, Tuple, Union, TYPE_CHECKING
+from typing import Any, List, Optional, Text, Dict, Tuple, Union, Type
 
-import rasa.utils.io as io_utils
-import rasa.core.actions.action
+from rasa.engine.graph import ExecutionContext
+from rasa.engine.storage.resource import Resource
+from rasa.engine.storage.storage import ModelStorage
+from rasa.exceptions import ModelNotFound
 from rasa.nlu.constants import TOKENS_NAMES
-from rasa.nlu.extractors.extractor import EntityExtractor, EntityTagSpec
-from rasa.shared.core.domain import Domain
-from rasa.core.featurizers.tracker_featurizers import (
-    TrackerFeaturizer,
-    FullDialogueTrackerFeaturizer,
-    MaxHistoryTrackerFeaturizer,
-)
-from rasa.core.featurizers.single_state_featurizer import SingleStateFeaturizer
+from rasa.nlu.extractors.extractor import EntityTagSpec, EntityExtractorMixin
+import rasa.core.actions.action
+from rasa.core.featurizers.precomputation import MessageContainerForCoreFeaturization
+from rasa.core.featurizers.tracker_featurizers import TrackerFeaturizer
+from rasa.core.featurizers.tracker_featurizers import MaxHistoryTrackerFeaturizer
+from rasa.shared.exceptions import RasaException
 from rasa.shared.nlu.constants import (
     ACTION_TEXT,
     ACTION_NAME,
     INTENT,
     TEXT,
     ENTITIES,
-    VALID_FEATURE_TYPES,
     FEATURE_TYPE_SENTENCE,
     ENTITY_ATTRIBUTE_TYPE,
     ENTITY_TAGS,
@@ -34,15 +33,27 @@ from rasa.shared.nlu.constants import (
     SPLIT_ENTITIES_BY_COMMA,
     SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
 )
-from rasa.shared.nlu.interpreter import NaturalLanguageInterpreter
-from rasa.core.policies.policy import Policy, PolicyPrediction
-from rasa.core.constants import DEFAULT_POLICY_PRIORITY, DIALOGUE
+from rasa.core.policies.policy import PolicyPrediction, Policy, SupportedData
+from rasa.core.constants import (
+    DIALOGUE,
+    POLICY_MAX_HISTORY,
+    DEFAULT_MAX_HISTORY,
+    DEFAULT_POLICY_PRIORITY,
+    POLICY_PRIORITY,
+)
 from rasa.shared.constants import DIAGNOSTIC_DATA
 from rasa.shared.core.constants import ACTIVE_LOOP, SLOTS, ACTION_LISTEN_NAME
 from rasa.shared.core.trackers import DialogueStateTracker
 from rasa.shared.core.generator import TrackerWithCachedStates
-import rasa.utils.train_utils
+from rasa.shared.core.events import EntitiesAdded, Event
+from rasa.shared.core.domain import Domain
+from rasa.shared.nlu.training_data.message import Message
+from rasa.shared.nlu.training_data.features import Features
+import rasa.shared.utils.io
+import rasa.utils.io
+from rasa.utils import train_utils
 from rasa.utils.tensorflow.models import RasaModel, TransformerRasaModel
+from rasa.utils.tensorflow import rasa_layers
 from rasa.utils.tensorflow.model_data import (
     RasaModelData,
     FeatureSignature,
@@ -50,7 +61,6 @@ from rasa.utils.tensorflow.model_data import (
     Data,
 )
 from rasa.utils.tensorflow.model_data_utils import convert_to_data_format
-import rasa.utils.tensorflow.numpy
 from rasa.utils.tensorflow.constants import (
     LABEL,
     IDS,
@@ -61,7 +71,9 @@ from rasa.utils.tensorflow.constants import (
     BATCH_STRATEGY,
     EPOCHS,
     RANDOM_SEED,
+    LEARNING_RATE,
     RANKING_LENGTH,
+    RENORMALIZE_CONFIDENCES,
     LOSS_TYPE,
     SIMILARITY_TYPE,
     NUM_NEG,
@@ -78,7 +90,7 @@ from rasa.utils.tensorflow.constants import (
     DROP_RATE_LABEL,
     DROP_RATE,
     DROP_RATE_ATTENTION,
-    WEIGHT_SPARSITY,
+    CONNECTION_DENSITY,
     KEY_RELATIVE_ATTENTION,
     VALUE_RELATIVE_ATTENTION,
     MAX_RELATIVE_POSITION,
@@ -106,12 +118,8 @@ from rasa.utils.tensorflow.constants import (
     MODEL_CONFIDENCE,
     SOFTMAX,
     BILOU_FLAG,
+    EPOCH_OVERRIDE,
 )
-from rasa.shared.core.events import EntitiesAdded, Event
-from rasa.shared.nlu.training_data.message import Message
-
-if TYPE_CHECKING:
-    from rasa.shared.nlu.training_data.features import Features
 
 
 logger = logging.getLogger(__name__)
@@ -123,17 +131,24 @@ LENGTH = "length"
 INDICES = "indices"
 SENTENCE_FEATURES_TO_ENCODE = [INTENT, TEXT, ACTION_NAME, ACTION_TEXT]
 SEQUENCE_FEATURES_TO_ENCODE = [TEXT, ACTION_TEXT, f"{LABEL}_{ACTION_TEXT}"]
-LABEL_FEATURES_TO_ENCODE = [f"{LABEL}_{ACTION_NAME}", f"{LABEL}_{ACTION_TEXT}"]
+LABEL_FEATURES_TO_ENCODE = [
+    f"{LABEL}_{ACTION_NAME}",
+    f"{LABEL}_{ACTION_TEXT}",
+    f"{LABEL}_{INTENT}",
+]
 STATE_LEVEL_FEATURES = [ENTITIES, SLOTS, ACTIVE_LOOP]
 PREDICTION_FEATURES = STATE_LEVEL_FEATURES + SENTENCE_FEATURES_TO_ENCODE + [DIALOGUE]
 
-SAVE_MODEL_FILE_NAME = "ted_policy"
 
-
+@DefaultV1Recipe.register(
+    DefaultV1Recipe.ComponentType.POLICY_WITH_END_TO_END_SUPPORT, is_trainable=True
+)
 class TEDPolicy(Policy):
-    """Transformer Embedding Dialogue (TED) Policy is described in
-    https://arxiv.org/abs/1910.00486.
-    This policy has a pre-defined architecture, which comprises the
+    """Transformer Embedding Dialogue (TED) Policy.
+
+    The model architecture is described in
+    detail in https://arxiv.org/abs/1910.00486.
+    In summary, the architecture comprises of the
     following steps:
         - concatenate user input (user intent and entities), previous system actions,
           slots and active forms for each time step into an input vector to
@@ -148,187 +163,207 @@ class TEDPolicy(Policy):
           (https://arxiv.org/abs/1709.03856) idea.
     """
 
-    # please make sure to update the docs when changing a default parameter
-    defaults = {
-        # ## Architecture of the used neural network
-        # Hidden layer sizes for layers before the embedding layers for user message
-        # and labels.
-        # The number of hidden layers is equal to the length of the corresponding list.
-        HIDDEN_LAYERS_SIZES: {TEXT: [], ACTION_TEXT: [], f"{LABEL}_{ACTION_TEXT}": []},
-        # Dense dimension to use for sparse features.
-        DENSE_DIMENSION: {
-            TEXT: 128,
-            ACTION_TEXT: 128,
-            f"{LABEL}_{ACTION_TEXT}": 128,
-            INTENT: 20,
-            ACTION_NAME: 20,
-            f"{LABEL}_{ACTION_NAME}": 20,
-            ENTITIES: 20,
-            SLOTS: 20,
-            ACTIVE_LOOP: 20,
-        },
-        # Default dimension to use for concatenating sequence and sentence features.
-        CONCAT_DIMENSION: {TEXT: 128, ACTION_TEXT: 128, f"{LABEL}_{ACTION_TEXT}": 128},
-        # Dimension size of embedding vectors before the dialogue transformer encoder.
-        ENCODING_DIMENSION: 50,
-        # Number of units in transformer encoders
-        TRANSFORMER_SIZE: {
-            TEXT: 128,
-            ACTION_TEXT: 128,
-            f"{LABEL}_{ACTION_TEXT}": 128,
-            DIALOGUE: 128,
-        },
-        # Number of layers in transformer encoders
-        NUM_TRANSFORMER_LAYERS: {
-            TEXT: 1,
-            ACTION_TEXT: 1,
-            f"{LABEL}_{ACTION_TEXT}": 1,
-            DIALOGUE: 1,
-        },
-        # Number of attention heads in transformer
-        NUM_HEADS: 4,
-        # If 'True' use key relative embeddings in attention
-        KEY_RELATIVE_ATTENTION: False,
-        # If 'True' use value relative embeddings in attention
-        VALUE_RELATIVE_ATTENTION: False,
-        # Max position for relative embeddings
-        MAX_RELATIVE_POSITION: None,
-        # Use a unidirectional or bidirectional encoder
-        # for `text`, `action_text`, and `label_action_text`.
-        UNIDIRECTIONAL_ENCODER: False,
-        # ## Training parameters
-        # Initial and final batch sizes:
-        # Batch size will be linearly increased for each epoch.
-        BATCH_SIZES: [64, 256],
-        # Strategy used whenc creating batches.
-        # Can be either 'sequence' or 'balanced'.
-        BATCH_STRATEGY: BALANCED,
-        # Number of epochs to train
-        EPOCHS: 1,
-        # Set random seed to any 'int' to get reproducible results
-        RANDOM_SEED: None,
-        # ## Parameters for embeddings
-        # Dimension size of embedding vectors
-        EMBEDDING_DIMENSION: 20,
-        # The number of incorrect labels. The algorithm will minimize
-        # their similarity to the user input during training.
-        NUM_NEG: 20,
-        # Type of similarity measure to use, either 'auto' or 'cosine' or 'inner'.
-        SIMILARITY_TYPE: AUTO,
-        # The type of the loss function, either 'cross_entropy' or 'margin'.
-        LOSS_TYPE: CROSS_ENTROPY,
-        # Number of top actions to normalize scores for. Applicable with
-        # loss type 'cross_entropy' and 'softmax' confidences. Set to 0
-        # to turn off normalization.
-        RANKING_LENGTH: 10,
-        # Indicates how similar the algorithm should try to make embedding vectors
-        # for correct labels.
-        # Should be 0.0 < ... < 1.0 for 'cosine' similarity type.
-        MAX_POS_SIM: 0.8,
-        # Maximum negative similarity for incorrect labels.
-        # Should be -1.0 < ... < 1.0 for 'cosine' similarity type.
-        MAX_NEG_SIM: -0.2,
-        # If 'True' the algorithm only minimizes maximum similarity over
-        # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
-        USE_MAX_NEG_SIM: True,
-        # If 'True' scale loss inverse proportionally to the confidence
-        # of the correct prediction
-        SCALE_LOSS: True,
-        # ## Regularization parameters
-        # The scale of regularization
-        REGULARIZATION_CONSTANT: 0.001,
-        # The scale of how important is to minimize the maximum similarity
-        # between embeddings of different labels,
-        # used only if 'loss_type' is set to 'margin'.
-        NEGATIVE_MARGIN_SCALE: 0.8,
-        # Dropout rate for embedding layers of dialogue features.
-        DROP_RATE_DIALOGUE: 0.1,
-        # Dropout rate for embedding layers of utterance level features.
-        DROP_RATE: 0.0,
-        # Dropout rate for embedding layers of label, e.g. action, features.
-        DROP_RATE_LABEL: 0.0,
-        # Dropout rate for attention.
-        DROP_RATE_ATTENTION: 0.0,
-        # Sparsity of the weights in dense layers
-        WEIGHT_SPARSITY: 0.8,
-        # If 'True' apply dropout to sparse input tensors
-        SPARSE_INPUT_DROPOUT: True,
-        # If 'True' apply dropout to dense input tensors
-        DENSE_INPUT_DROPOUT: True,
-        # If 'True' random tokens of the input message will be masked and the model
-        # should predict those tokens.
-        MASKED_LM: False,
-        # ## Evaluation parameters
-        # How often calculate validation accuracy.
-        # Small values may hurt performance, e.g. model accuracy.
-        EVAL_NUM_EPOCHS: 20,
-        # How many examples to use for hold out validation set
-        # Large values may hurt performance, e.g. model accuracy.
-        EVAL_NUM_EXAMPLES: 0,
-        # If you want to use tensorboard to visualize training and validation metrics,
-        # set this option to a valid output directory.
-        TENSORBOARD_LOG_DIR: None,
-        # Define when training metrics for tensorboard should be logged.
-        # Either after every epoch or for every training step.
-        # Valid values: 'epoch' and 'minibatch'
-        TENSORBOARD_LOG_LEVEL: "epoch",
-        # Perform model checkpointing
-        CHECKPOINT_MODEL: False,
-        # Only pick e2e prediction if the policy is confident enough
-        E2E_CONFIDENCE_THRESHOLD: 0.5,
-        # Specify what features to use as sequence and sentence features.
-        # By default all features in the pipeline are used.
-        FEATURIZERS: [],
-        # If set to true, entities are predicted in user utterances.
-        ENTITY_RECOGNITION: True,
-        # if 'True' applies sigmoid on all similarity terms and adds
-        # it to the loss function to ensure that similarity values are
-        # approximately bounded. Used inside softmax loss only.
-        CONSTRAIN_SIMILARITIES: False,
-        # Model confidence to be returned during inference. Possible values -
-        # 'softmax', 'cosine' and 'inner'.
-        MODEL_CONFIDENCE: SOFTMAX,
-        # 'BILOU_flag' determines whether to use BILOU tagging or not.
-        # If set to 'True' labelling is more rigorous, however more
-        # examples per entity are required.
-        # Rule of thumb: you should have more than 100 examples per entity.
-        BILOU_FLAG: True,
-        # Split entities by comma, this makes sense e.g. for a list of
-        # ingredients in a recipe, but it doesn't make sense for the parts of
-        # an address
-        SPLIT_ENTITIES_BY_COMMA: SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
-    }
-
     @staticmethod
-    def _standard_featurizer(max_history: Optional[int] = None) -> TrackerFeaturizer:
-        return MaxHistoryTrackerFeaturizer(
-            SingleStateFeaturizer(), max_history=max_history
-        )
+    def get_default_config() -> Dict[Text, Any]:
+        """Returns the default config (see parent class for full docstring)."""
+        # please make sure to update the docs when changing a default parameter
+        return {
+            # ## Architecture of the used neural network
+            # Hidden layer sizes for layers before the embedding layers for user message
+            # and labels.
+            # The number of hidden layers is equal to the length of the corresponding
+            # list.
+            HIDDEN_LAYERS_SIZES: {
+                TEXT: [],
+                ACTION_TEXT: [],
+                f"{LABEL}_{ACTION_TEXT}": [],
+            },
+            # Dense dimension to use for sparse features.
+            DENSE_DIMENSION: {
+                TEXT: 128,
+                ACTION_TEXT: 128,
+                f"{LABEL}_{ACTION_TEXT}": 128,
+                INTENT: 20,
+                ACTION_NAME: 20,
+                f"{LABEL}_{ACTION_NAME}": 20,
+                ENTITIES: 20,
+                SLOTS: 20,
+                ACTIVE_LOOP: 20,
+            },
+            # Default dimension to use for concatenating sequence and sentence features.
+            CONCAT_DIMENSION: {
+                TEXT: 128,
+                ACTION_TEXT: 128,
+                f"{LABEL}_{ACTION_TEXT}": 128,
+            },
+            # Dimension size of embedding vectors before the dialogue transformer
+            # encoder.
+            ENCODING_DIMENSION: 50,
+            # Number of units in transformer encoders
+            TRANSFORMER_SIZE: {
+                TEXT: 128,
+                ACTION_TEXT: 128,
+                f"{LABEL}_{ACTION_TEXT}": 128,
+                DIALOGUE: 128,
+            },
+            # Number of layers in transformer encoders
+            NUM_TRANSFORMER_LAYERS: {
+                TEXT: 1,
+                ACTION_TEXT: 1,
+                f"{LABEL}_{ACTION_TEXT}": 1,
+                DIALOGUE: 1,
+            },
+            # Number of attention heads in transformer
+            NUM_HEADS: 4,
+            # If 'True' use key relative embeddings in attention
+            KEY_RELATIVE_ATTENTION: False,
+            # If 'True' use value relative embeddings in attention
+            VALUE_RELATIVE_ATTENTION: False,
+            # Max position for relative embeddings. Only in effect if key- or value
+            # relative
+            # attention are turned on
+            MAX_RELATIVE_POSITION: 5,
+            # Use a unidirectional or bidirectional encoder
+            # for `text`, `action_text`, and `label_action_text`.
+            UNIDIRECTIONAL_ENCODER: False,
+            # ## Training parameters
+            # Initial and final batch sizes:
+            # Batch size will be linearly increased for each epoch.
+            BATCH_SIZES: [64, 256],
+            # Strategy used whenc creating batches.
+            # Can be either 'sequence' or 'balanced'.
+            BATCH_STRATEGY: BALANCED,
+            # Number of epochs to train
+            EPOCHS: 1,
+            # Set random seed to any 'int' to get reproducible results
+            RANDOM_SEED: None,
+            # Initial learning rate for the optimizer
+            LEARNING_RATE: 0.001,
+            # ## Parameters for embeddings
+            # Dimension size of embedding vectors
+            EMBEDDING_DIMENSION: 20,
+            # The number of incorrect labels. The algorithm will minimize
+            # their similarity to the user input during training.
+            NUM_NEG: 20,
+            # Type of similarity measure to use, either 'auto' or 'cosine' or 'inner'.
+            SIMILARITY_TYPE: AUTO,
+            # The type of the loss function, either 'cross_entropy' or 'margin'.
+            LOSS_TYPE: CROSS_ENTROPY,
+            # Number of top actions for which confidences should be predicted.
+            # The number of  Set to `0` if confidences for all actions should be
+            # predicted. The confidences for all other actions will be set to 0.
+            RANKING_LENGTH: 0,
+            # Determines wether the confidences of the chosen top actions should be
+            # renormalized so that they sum up to 1. By default, we do not renormalize
+            # and return the confidences for the top actions as is.
+            # Note that renormalization only makes sense if confidences are generated
+            # via `softmax`.
+            RENORMALIZE_CONFIDENCES: False,
+            # Indicates how similar the algorithm should try to make embedding vectors
+            # for correct labels.
+            # Should be 0.0 < ... < 1.0 for 'cosine' similarity type.
+            MAX_POS_SIM: 0.8,
+            # Maximum negative similarity for incorrect labels.
+            # Should be -1.0 < ... < 1.0 for 'cosine' similarity type.
+            MAX_NEG_SIM: -0.2,
+            # If 'True' the algorithm only minimizes maximum similarity over
+            # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
+            USE_MAX_NEG_SIM: True,
+            # If 'True' scale loss inverse proportionally to the confidence
+            # of the correct prediction
+            SCALE_LOSS: True,
+            # ## Regularization parameters
+            # The scale of regularization
+            REGULARIZATION_CONSTANT: 0.001,
+            # The scale of how important is to minimize the maximum similarity
+            # between embeddings of different labels,
+            # used only if 'loss_type' is set to 'margin'.
+            NEGATIVE_MARGIN_SCALE: 0.8,
+            # Dropout rate for embedding layers of dialogue features.
+            DROP_RATE_DIALOGUE: 0.1,
+            # Dropout rate for embedding layers of utterance level features.
+            DROP_RATE: 0.0,
+            # Dropout rate for embedding layers of label, e.g. action, features.
+            DROP_RATE_LABEL: 0.0,
+            # Dropout rate for attention.
+            DROP_RATE_ATTENTION: 0.0,
+            # Fraction of trainable weights in internal layers.
+            CONNECTION_DENSITY: 0.2,
+            # If 'True' apply dropout to sparse input tensors
+            SPARSE_INPUT_DROPOUT: True,
+            # If 'True' apply dropout to dense input tensors
+            DENSE_INPUT_DROPOUT: True,
+            # If 'True' random tokens of the input message will be masked. Since there
+            # is no related loss term used inside TED, the masking effectively becomes
+            # just input dropout applied to the text of user utterances.
+            MASKED_LM: False,
+            # ## Evaluation parameters
+            # How often calculate validation accuracy.
+            # Small values may hurt performance.
+            EVAL_NUM_EPOCHS: 20,
+            # How many examples to use for hold out validation set
+            # Large values may hurt performance, e.g. model accuracy.
+            # Set to 0 for no validation.
+            EVAL_NUM_EXAMPLES: 0,
+            # If you want to use tensorboard to visualize training and validation
+            # metrics, set this option to a valid output directory.
+            TENSORBOARD_LOG_DIR: None,
+            # Define when training metrics for tensorboard should be logged.
+            # Either after every epoch or for every training step.
+            # Valid values: 'epoch' and 'batch'
+            TENSORBOARD_LOG_LEVEL: "epoch",
+            # Perform model checkpointing
+            CHECKPOINT_MODEL: False,
+            # Only pick e2e prediction if the policy is confident enough
+            E2E_CONFIDENCE_THRESHOLD: 0.5,
+            # Specify what features to use as sequence and sentence features.
+            # By default all features in the pipeline are used.
+            FEATURIZERS: [],
+            # If set to true, entities are predicted in user utterances.
+            ENTITY_RECOGNITION: True,
+            # if 'True' applies sigmoid on all similarity terms and adds
+            # it to the loss function to ensure that similarity values are
+            # approximately bounded. Used inside cross-entropy loss only.
+            CONSTRAIN_SIMILARITIES: False,
+            # Model confidence to be returned during inference. Currently, the only
+            # possible value is `softmax`.
+            MODEL_CONFIDENCE: SOFTMAX,
+            # 'BILOU_flag' determines whether to use BILOU tagging or not.
+            # If set to 'True' labelling is more rigorous, however more
+            # examples per entity are required.
+            # Rule of thumb: you should have more than 100 examples per entity.
+            BILOU_FLAG: True,
+            # Split entities by comma, this makes sense e.g. for a list of
+            # ingredients in a recipe, but it doesn't make sense for the parts of
+            # an address
+            SPLIT_ENTITIES_BY_COMMA: SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
+            # Max history of the policy, unbounded by default
+            POLICY_MAX_HISTORY: DEFAULT_MAX_HISTORY,
+            # Determines the importance of policies, higher values take precedence
+            POLICY_PRIORITY: DEFAULT_POLICY_PRIORITY,
+        }
 
     def __init__(
         self,
-        featurizer: Optional[TrackerFeaturizer] = None,
-        priority: int = DEFAULT_POLICY_PRIORITY,
-        max_history: Optional[int] = None,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
         model: Optional[RasaModel] = None,
-        fake_features: Optional[Dict[Text, List["Features"]]] = None,
+        featurizer: Optional[TrackerFeaturizer] = None,
+        fake_features: Optional[Dict[Text, List[Features]]] = None,
         entity_tag_specs: Optional[List[EntityTagSpec]] = None,
-        should_finetune: bool = False,
-        **kwargs: Any,
     ) -> None:
-        """Declare instance variables with default values."""
-        self.split_entities_config = rasa.utils.train_utils.init_split_entities(
-            kwargs.get(SPLIT_ENTITIES_BY_COMMA, SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE),
-            self.defaults[SPLIT_ENTITIES_BY_COMMA],
-        )
-
-        if not featurizer:
-            featurizer = self._standard_featurizer(max_history)
-
+        """Declares instance variables with default values."""
         super().__init__(
-            featurizer, priority, should_finetune=should_finetune, **kwargs
+            config, model_storage, resource, execution_context, featurizer=featurizer
         )
-        self._load_params(**kwargs)
+
+        self.split_entities_config = rasa.utils.train_utils.init_split_entities(
+            config[SPLIT_ENTITIES_BY_COMMA], SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
+        )
+
+        self._load_params(config)
 
         self.model = model
 
@@ -340,33 +375,76 @@ class TEDPolicy(Policy):
         self.only_e2e = TEXT in self.fake_features and INTENT not in self.fake_features
 
         self._label_data: Optional[RasaModelData] = None
-        self.data_example: Optional[Dict[Text, List[np.ndarray]]] = None
+        self.data_example: Optional[Dict[Text, Dict[Text, List[FeatureArray]]]] = None
 
-    def _load_params(self, **kwargs: Dict[Text, Any]) -> None:
-        new_config = rasa.utils.train_utils.check_core_deprecated_options(kwargs)
-        self.config = rasa.utils.train_utils.override_defaults(
-            self.defaults, new_config
-        )
+        self.tmp_checkpoint_dir = None
+        if self.config[CHECKPOINT_MODEL]:
+            self.tmp_checkpoint_dir = Path(rasa.utils.io.create_temporary_directory())
 
+    @staticmethod
+    def model_class() -> Type[TED]:
+        """Gets the class of the model architecture to be used by the policy.
+
+        Returns:
+            Required class.
+        """
+        return TED
+
+    @classmethod
+    def _metadata_filename(cls) -> Optional[Text]:
+        return "ted_policy"
+
+    def _load_params(self, config: Dict[Text, Any]) -> None:
+        new_config = rasa.utils.train_utils.check_core_deprecated_options(config)
+        self.config = new_config
+        self._auto_update_configuration()
+
+    def _auto_update_configuration(self) -> None:
+        """Takes care of deprecations and compatibility of parameters."""
         self.config = rasa.utils.train_utils.update_confidence_type(self.config)
-
         rasa.utils.train_utils.validate_configuration_settings(self.config)
-
-        self.config = rasa.utils.train_utils.update_deprecated_loss_type(self.config)
         self.config = rasa.utils.train_utils.update_similarity_type(self.config)
         self.config = rasa.utils.train_utils.update_evaluation_parameters(self.config)
 
     def _create_label_data(
-        self, domain: Domain, interpreter: NaturalLanguageInterpreter
-    ) -> Tuple[RasaModelData, List[Dict[Text, List["Features"]]]]:
+        self,
+        domain: Domain,
+        precomputations: Optional[MessageContainerForCoreFeaturization],
+    ) -> Tuple[RasaModelData, List[Dict[Text, List[Features]]]]:
         # encode all label_ids with policies' featurizer
         state_featurizer = self.featurizer.state_featurizer
-        encoded_all_labels = state_featurizer.encode_all_actions(domain, interpreter)
+        encoded_all_labels = (
+            state_featurizer.encode_all_labels(domain, precomputations)
+            if state_featurizer is not None
+            else []
+        )
 
         attribute_data, _ = convert_to_data_format(
             encoded_all_labels, featurizers=self.config[FEATURIZERS]
         )
 
+        label_data = self._assemble_label_data(attribute_data, domain)
+
+        return label_data, encoded_all_labels
+
+    def _assemble_label_data(
+        self, attribute_data: Data, domain: Domain
+    ) -> RasaModelData:
+        """Constructs data regarding labels to be fed to the model.
+
+        The resultant model data can possibly contain one or both of the
+        keys - [`label_action_name`, `label_action_text`] but will definitely
+        contain the `label` key.
+        `label_action_*` will contain the sequence, sentence and mask features
+        for corresponding labels and `label` will contain the numerical label ids.
+
+        Args:
+            attribute_data: Feature data for all labels.
+            domain: Domain of the assistant.
+
+        Returns:
+            Features of labels ready to be fed to the model.
+        """
         label_data = RasaModelData()
         label_data.add_data(attribute_data, key_prefix=f"{LABEL_KEY}_")
         label_data.add_lengths(
@@ -375,24 +453,34 @@ class TEDPolicy(Policy):
             f"{LABEL}_{ACTION_TEXT}",
             SEQUENCE,
         )
-
         label_ids = np.arange(domain.num_actions)
         label_data.add_features(
             LABEL_KEY,
             LABEL_SUB_KEY,
             [FeatureArray(np.expand_dims(label_ids, -1), number_of_dimensions=2)],
         )
+        return label_data
 
-        return label_data, encoded_all_labels
+    @staticmethod
+    def _should_extract_entities(
+        entity_tags: List[List[Dict[Text, List[Features]]]]
+    ) -> bool:
+        for turns_tags in entity_tags:
+            for turn_tags in turns_tags:
+                # if turn_tags are empty or all entity tag indices are `0`
+                # it means that all the inputs only contain NO_ENTITY_TAG
+                if turn_tags and np.any(turn_tags[ENTITY_TAGS][0].features):
+                    return True
+        return False
 
     def _create_data_for_entities(
-        self, entity_tags: Optional[List[List[Dict[Text, List["Features"]]]]]
+        self, entity_tags: Optional[List[List[Dict[Text, List[Features]]]]]
     ) -> Optional[Data]:
         if not self.config[ENTITY_RECOGNITION]:
-            return
+            return None
 
         # check that there are real entity tags
-        if entity_tags and any([any(turn_tags) for turn_tags in entity_tags]):
+        if entity_tags and self._should_extract_entities(entity_tags):
             entity_tags_data, _ = convert_to_data_format(entity_tags)
             return entity_tags_data
 
@@ -403,12 +491,14 @@ class TEDPolicy(Policy):
         )
         self.config[ENTITY_RECOGNITION] = False
 
+        return None
+
     def _create_model_data(
         self,
-        tracker_state_features: List[List[Dict[Text, List["Features"]]]],
+        tracker_state_features: List[List[Dict[Text, List[Features]]]],
         label_ids: Optional[np.ndarray] = None,
-        entity_tags: Optional[List[List[Dict[Text, List["Features"]]]]] = None,
-        encoded_all_labels: Optional[List[Dict[Text, List["Features"]]]] = None,
+        entity_tags: Optional[List[List[Dict[Text, List[Features]]]]] = None,
+        encoded_all_labels: Optional[List[Dict[Text, List[Features]]]] = None,
     ) -> RasaModelData:
         """Combine all model related data into RasaModelData.
 
@@ -475,86 +565,189 @@ class TEDPolicy(Policy):
 
         return model_data
 
-    def train(
+    @staticmethod
+    def _get_trackers_for_training(
+        trackers: List[TrackerWithCachedStates],
+    ) -> List[TrackerWithCachedStates]:
+        """Filters out the list of trackers which should not be used for training.
+
+        Args:
+            trackers: All trackers available for training.
+
+        Returns:
+            Trackers which should be used for training.
+        """
+        # By default, we train on all available trackers.
+        return trackers
+
+    def _prepare_for_training(
         self,
-        training_trackers: List[TrackerWithCachedStates],
+        trackers: List[TrackerWithCachedStates],
         domain: Domain,
-        interpreter: NaturalLanguageInterpreter,
+        precomputations: MessageContainerForCoreFeaturization,
         **kwargs: Any,
-    ) -> None:
-        """Train the policy on given training trackers."""
+    ) -> Tuple[RasaModelData, np.ndarray]:
+        """Prepares data to be fed into the model.
 
-        if not training_trackers:
-            logger.error(
-                f"Can not train '{self.__class__.__name__}'. No data was provided. "
-                f"Skipping training of the policy."
-            )
-            return
+        Args:
+            trackers: List of training trackers to be featurized.
+            domain: Domain of the assistant.
+            precomputations: Contains precomputed features and attributes.
+            **kwargs: Any other arguments.
 
+        Returns:
+            Featurized data to be fed to the model and corresponding label ids.
+        """
+        training_trackers = self._get_trackers_for_training(trackers)
         # dealing with training data
-        tracker_state_features, label_ids, entity_tags = self.featurize_for_training(
+        tracker_state_features, label_ids, entity_tags = self._featurize_for_training(
             training_trackers,
             domain,
-            interpreter,
+            precomputations=precomputations,
             bilou_tagging=self.config[BILOU_FLAG],
             **kwargs,
         )
 
+        if not tracker_state_features:
+            return RasaModelData(), label_ids
+
         self._label_data, encoded_all_labels = self._create_label_data(
-            domain, interpreter
+            domain, precomputations=precomputations
         )
 
         # extract actual training data to feed to model
         model_data = self._create_model_data(
             tracker_state_features, label_ids, entity_tags, encoded_all_labels
         )
-        if model_data.is_empty():
-            logger.error(
-                f"Can not train '{self.__class__.__name__}'. No data was provided. "
-                f"Skipping training of the policy."
-            )
-            return
 
         if self.config[ENTITY_RECOGNITION]:
-            self._entity_tag_specs = self.featurizer.state_featurizer.entity_tag_specs
+            self._entity_tag_specs = (
+                self.featurizer.state_featurizer.entity_tag_specs
+                if self.featurizer.state_featurizer is not None
+                else []
+            )
 
         # keep one example for persisting and loading
         self.data_example = model_data.first_data_example()
 
+        return model_data, label_ids
+
+    def run_training(
+        self, model_data: RasaModelData, label_ids: Optional[np.ndarray] = None
+    ) -> None:
+        """Feeds the featurized training data to the model.
+
+        Args:
+            model_data: Featurized training data.
+            label_ids: Label ids corresponding to the data points in `model_data`.
+                These may or may not be used by the function depending
+                on how the policy is trained.
+        """
         if not self.finetune_mode:
             # This means the model wasn't loaded from a
             # previously trained model and hence needs
             # to be instantiated.
-            self.model = TED(
+            self.model = self.model_class()(
                 model_data.get_signature(),
                 self.config,
                 isinstance(self.featurizer, MaxHistoryTrackerFeaturizer),
                 self._label_data,
                 self._entity_tag_specs,
             )
-
-        self.model.fit(
+            self.model.compile(
+                optimizer=tf.keras.optimizers.Adam(self.config[LEARNING_RATE])
+            )
+        (
+            data_generator,
+            validation_data_generator,
+        ) = rasa.utils.train_utils.create_data_generators(
             model_data,
-            self.config[EPOCHS],
             self.config[BATCH_SIZES],
+            self.config[EPOCHS],
+            self.config[BATCH_STRATEGY],
             self.config[EVAL_NUM_EXAMPLES],
-            self.config[EVAL_NUM_EPOCHS],
-            batch_strategy=self.config[BATCH_STRATEGY],
+            self.config[RANDOM_SEED],
+        )
+        callbacks = rasa.utils.train_utils.create_common_callbacks(
+            self.config[EPOCHS],
+            self.config[TENSORBOARD_LOG_DIR],
+            self.config[TENSORBOARD_LOG_LEVEL],
+            self.tmp_checkpoint_dir,
         )
 
-    def _featurize_tracker_for_e2e(
+        if self.model is None:
+            raise ModelNotFound("No model was detected prior to training.")
+
+        self.model.fit(
+            data_generator,
+            epochs=self.config[EPOCHS],
+            validation_data=validation_data_generator,
+            validation_freq=self.config[EVAL_NUM_EPOCHS],
+            callbacks=callbacks,
+            verbose=False,
+            shuffle=False,  # we use custom shuffle inside data generator
+        )
+
+    def train(
+        self,
+        training_trackers: List[TrackerWithCachedStates],
+        domain: Domain,
+        precomputations: Optional[MessageContainerForCoreFeaturization] = None,
+        **kwargs: Any,
+    ) -> Resource:
+        """Trains the policy (see parent class for full docstring)."""
+        if not training_trackers:
+            rasa.shared.utils.io.raise_warning(
+                f"Skipping training of `{self.__class__.__name__}` "
+                f"as no data was provided. You can exclude this "
+                f"policy in the configuration "
+                f"file to avoid this warning.",
+                category=UserWarning,
+            )
+            return self._resource
+
+        training_trackers = SupportedData.trackers_for_supported_data(
+            self.supported_data(), training_trackers
+        )
+
+        model_data, label_ids = self._prepare_for_training(
+            training_trackers, domain, precomputations
+        )
+
+        if model_data.is_empty():
+            rasa.shared.utils.io.raise_warning(
+                f"Skipping training of `{self.__class__.__name__}` "
+                f"as no data was provided. You can exclude this "
+                f"policy in the configuration "
+                f"file to avoid this warning.",
+                category=UserWarning,
+            )
+            return self._resource
+
+        self.run_training(model_data, label_ids)
+
+        self.persist()
+
+        return self._resource
+
+    def _featurize_tracker(
         self,
         tracker: DialogueStateTracker,
         domain: Domain,
-        interpreter: NaturalLanguageInterpreter,
-    ) -> List[List[Dict[Text, List["Features"]]]]:
+        precomputations: Optional[MessageContainerForCoreFeaturization],
+        rule_only_data: Optional[Dict[Text, Any]],
+    ) -> List[List[Dict[Text, List[Features]]]]:
         # construct two examples in the batch to be fed to the model -
         # one by featurizing last user text
         # and second - an optional one (see conditions below),
         # the first example in the constructed batch either does not contain user input
         # or uses intent or text based on whether TED is e2e only.
-        tracker_state_features = self.featurizer.create_state_features(
-            [tracker], domain, interpreter, use_text_for_last_user_input=self.only_e2e
+        tracker_state_features = self._featurize_for_prediction(
+            tracker,
+            domain,
+            precomputations=precomputations,
+            use_text_for_last_user_input=self.only_e2e,
+            rule_only_data=rule_only_data,
         )
         # the second - text, but only after user utterance and if not only e2e
         if (
@@ -562,13 +755,17 @@ class TEDPolicy(Policy):
             and TEXT in self.fake_features
             and not self.only_e2e
         ):
-            tracker_state_features += self.featurizer.create_state_features(
-                [tracker], domain, interpreter, use_text_for_last_user_input=True
+            tracker_state_features += self._featurize_for_prediction(
+                tracker,
+                domain,
+                precomputations=precomputations,
+                use_text_for_last_user_input=True,
+                rule_only_data=rule_only_data,
             )
         return tracker_state_features
 
     def _pick_confidence(
-        self, confidences: np.ndarray, similarities: np.ndarray
+        self, confidences: np.ndarray, similarities: np.ndarray, domain: Domain
     ) -> Tuple[np.ndarray, bool]:
         # the confidences and similarities have shape (batch-size x number of actions)
         # batch-size can only be 1 or 2;
@@ -583,92 +780,104 @@ class TEDPolicy(Policy):
             # we use similarities to pick appropriate input,
             # since it seems to be more accurate measure,
             # policy is trained to maximize the similarity not the confidence
+            non_e2e_action_name = domain.action_names_or_texts[
+                np.argmax(confidences[0])
+            ]
+            logger.debug(f"User intent lead to '{non_e2e_action_name}'.")
+            e2e_action_name = domain.action_names_or_texts[np.argmax(confidences[1])]
+            logger.debug(f"User text lead to '{e2e_action_name}'.")
             if (
                 np.max(confidences[1]) > self.config[E2E_CONFIDENCE_THRESHOLD]
                 # TODO maybe compare confidences is better
                 and np.max(similarities[1]) > np.max(similarities[0])
             ):
+                logger.debug(f"TED predicted '{e2e_action_name}' based on user text.")
                 return confidences[1], True
 
+            logger.debug(f"TED predicted '{non_e2e_action_name}' based on user intent.")
             return confidences[0], False
 
         # by default the first example in a batch is the one to use for prediction
+        predicted_action_name = domain.action_names_or_texts[np.argmax(confidences[0])]
+        basis_for_prediction = "text" if self.only_e2e else "intent"
+        logger.debug(
+            f"TED predicted '{predicted_action_name}' "
+            f"based on user {basis_for_prediction}."
+        )
         return confidences[0], self.only_e2e
 
     def predict_action_probabilities(
         self,
         tracker: DialogueStateTracker,
         domain: Domain,
-        interpreter: NaturalLanguageInterpreter,
+        rule_only_data: Optional[Dict[Text, Any]] = None,
+        precomputations: Optional[MessageContainerForCoreFeaturization] = None,
         **kwargs: Any,
     ) -> PolicyPrediction:
-        """Predicts the next action the bot should take.
-
-        See the docstring of the parent class `Policy` for more information.
-        """
+        """Predicts the next action (see parent class for full docstring)."""
         if self.model is None:
             return self._prediction(self._default_predictions(domain))
 
         # create model data from tracker
-        tracker_state_features = self._featurize_tracker_for_e2e(
-            tracker, domain, interpreter
+        tracker_state_features = self._featurize_tracker(
+            tracker, domain, precomputations, rule_only_data=rule_only_data
         )
         model_data = self._create_model_data(tracker_state_features)
-
-        output = self.model.predict(model_data)
+        outputs: Dict[Text, np.ndarray] = self.model.run_inference(model_data)
 
         # take the last prediction in the sequence
-        similarities = output["similarities"].numpy()[:, -1, :]
-        confidences = output["action_scores"].numpy()[:, -1, :]
+        similarities = outputs["similarities"][:, -1, :]
+        confidences = outputs["scores"][:, -1, :]
         # take correct prediction from batch
-        confidence, is_e2e_prediction = self._pick_confidence(confidences, similarities)
+        confidence, is_e2e_prediction = self._pick_confidence(
+            confidences, similarities, domain
+        )
 
-        if self.config[RANKING_LENGTH] > 0 and self.config[MODEL_CONFIDENCE] == SOFTMAX:
-            # TODO: This should be removed in 3.0 when softmax as
-            #  model confidence and normalization is completely deprecated.
-            confidence = rasa.utils.train_utils.normalize(
-                confidence, self.config[RANKING_LENGTH]
+        # rank and mask the confidence (if we need to)
+        ranking_length = self.config[RANKING_LENGTH]
+        if 0 < ranking_length < len(confidence):
+            renormalize = (
+                self.config[RENORMALIZE_CONFIDENCES]
+                and self.config[MODEL_CONFIDENCE] == SOFTMAX
+            )
+            _, confidence = train_utils.rank_and_mask(
+                confidence, ranking_length=ranking_length, renormalize=renormalize
             )
 
         optional_events = self._create_optional_event_for_entities(
-            output, is_e2e_prediction, interpreter, tracker
+            outputs, is_e2e_prediction, precomputations, tracker
         )
 
         return self._prediction(
             confidence.tolist(),
             is_end_to_end_prediction=is_e2e_prediction,
             optional_events=optional_events,
-            diagnostic_data=rasa.utils.tensorflow.numpy.values_to_numpy(
-                output.get(DIAGNOSTIC_DATA)
-            ),
+            diagnostic_data=outputs.get(DIAGNOSTIC_DATA),
         )
 
     def _create_optional_event_for_entities(
         self,
         prediction_output: Dict[Text, tf.Tensor],
         is_e2e_prediction: bool,
-        interpreter: NaturalLanguageInterpreter,
+        precomputations: Optional[MessageContainerForCoreFeaturization],
         tracker: DialogueStateTracker,
     ) -> Optional[List[Event]]:
         if tracker.latest_action_name != ACTION_LISTEN_NAME or not is_e2e_prediction:
             # entities belong only to the last user message
             # and only if user text was used for prediction,
             # a user message always comes after action listen
-            return
+            return None
 
         if not self.config[ENTITY_RECOGNITION]:
             # entity recognition is not turned on, no entities can be predicted
-            return
+            return None
 
         # The batch dimension of entity prediction is not the same as batch size,
         # rather it is the number of last (if max history featurizer else all)
         # text inputs in the batch
         # therefore, in order to pick entities from the latest user message
         # we need to pick entities from the last batch dimension of entity prediction
-        (
-            predicted_tags,
-            confidence_values,
-        ) = rasa.utils.train_utils.entity_label_to_tags(
+        predicted_tags, confidence_values = rasa.utils.train_utils.entity_label_to_tags(
             prediction_output,
             self._entity_tag_specs,
             self.config[BILOU_FLAG],
@@ -677,14 +886,17 @@ class TEDPolicy(Policy):
 
         if ENTITY_ATTRIBUTE_TYPE not in predicted_tags:
             # no entities detected
-            return
+            return None
 
         # entities belong to the last message of the tracker
         # convert the predicted tags to actual entities
-        text = tracker.latest_message.text
-        parsed_message = interpreter.featurize_message(Message(data={TEXT: text}))
+        text = tracker.latest_message.text if tracker.latest_message is not None else ""
+        if precomputations is not None:
+            parsed_message = precomputations.lookup_message(user_text=text)
+        else:
+            parsed_message = Message(data={TEXT: text})
         tokens = parsed_message.get(TOKENS_NAMES[TEXT])
-        entities = EntityExtractor.convert_predictions_into_entities(
+        entities = EntityExtractorMixin.convert_predictions_into_entities(
             text,
             tokens,
             predicted_tags,
@@ -698,7 +910,7 @@ class TEDPolicy(Policy):
 
         return [EntitiesAdded(entities)]
 
-    def persist(self, path: Union[Text, Path]) -> None:
+    def persist(self) -> None:
         """Persists the policy to a storage."""
         if self.model is None:
             logger.debug(
@@ -707,90 +919,80 @@ class TEDPolicy(Policy):
             )
             return
 
-        model_path = Path(path)
-        tf_model_file = model_path / f"{SAVE_MODEL_FILE_NAME}.tf_model"
+        with self._model_storage.write_to(self._resource) as model_path:
+            model_filename = self._metadata_filename()
+            tf_model_file = model_path / f"{model_filename}.tf_model"
 
-        rasa.shared.utils.io.create_directory_for_file(tf_model_file)
+            rasa.shared.utils.io.create_directory_for_file(tf_model_file)
 
-        self.featurizer.persist(path)
+            self.featurizer.persist(model_path)
 
-        if self.model.checkpoint_model:
-            self.model.copy_best(str(tf_model_file))
-        else:
+            if self.config[CHECKPOINT_MODEL] and self.tmp_checkpoint_dir:
+                self.model.load_weights(self.tmp_checkpoint_dir / "checkpoint.tf_model")
+                # Save an empty file to flag that this model has been
+                # produced using checkpointing
+                checkpoint_marker = model_path / f"{model_filename}.from_checkpoint.pkl"
+                checkpoint_marker.touch()
+
             self.model.save(str(tf_model_file))
 
-        io_utils.json_pickle(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.priority.pkl", self.priority
-        )
-        io_utils.pickle_dump(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.meta.pkl", self.config
-        )
-        io_utils.pickle_dump(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.data_example.pkl", self.data_example
-        )
-        io_utils.pickle_dump(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.fake_features.pkl",
-            self.fake_features,
-        )
-        io_utils.pickle_dump(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.label_data.pkl",
-            dict(self._label_data.data),
-        )
+            self.persist_model_utilities(model_path)
 
+    def persist_model_utilities(self, model_path: Path) -> None:
+        """Persists model's utility attributes like model weights, etc.
+
+        Args:
+            model_path: Path where model is to be persisted
+        """
+        model_filename = self._metadata_filename()
+        rasa.utils.io.json_pickle(
+            model_path / f"{model_filename}.priority.pkl", self.priority
+        )
+        rasa.utils.io.pickle_dump(
+            model_path / f"{model_filename}.meta.pkl", self.config
+        )
+        rasa.utils.io.pickle_dump(
+            model_path / f"{model_filename}.data_example.pkl", self.data_example
+        )
+        rasa.utils.io.pickle_dump(
+            model_path / f"{model_filename}.fake_features.pkl", self.fake_features
+        )
+        rasa.utils.io.pickle_dump(
+            model_path / f"{model_filename}.label_data.pkl",
+            dict(self._label_data.data) if self._label_data is not None else {},
+        )
         entity_tag_specs = (
             [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
             if self._entity_tag_specs
             else []
         )
         rasa.shared.utils.io.dump_obj_as_json_to_file(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.entity_tag_specs.json",
-            entity_tag_specs,
+            model_path / f"{model_filename}.entity_tag_specs.json", entity_tag_specs
         )
 
     @classmethod
-    def load(
-        cls,
-        path: Union[Text, Path],
-        should_finetune: bool = False,
-        epoch_override: int = defaults[EPOCHS],
-        **kwargs: Any,
-    ) -> "TEDPolicy":
-        """Loads a policy from the storage.
+    def _load_model_utilities(cls, model_path: Path) -> Dict[Text, Any]:
+        """Loads model's utility attributes.
 
-        **Needs to load its featurizer**
+        Args:
+            model_path: Path where model is to be persisted.
         """
-        model_path = Path(path)
-
-        if not model_path.exists():
-            logger.error(
-                f"Failed to load TED policy model. Path "
-                f"'{model_path.absolute()}' doesn't exist."
-            )
-            return
-
-        tf_model_file = model_path / f"{SAVE_MODEL_FILE_NAME}.tf_model"
-
-        featurizer = TrackerFeaturizer.load(path)
-
-        if not (model_path / f"{SAVE_MODEL_FILE_NAME}.data_example.pkl").is_file():
-            return cls(featurizer=featurizer)
-
-        loaded_data = io_utils.pickle_load(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.data_example.pkl"
+        tf_model_file = model_path / f"{cls._metadata_filename()}.tf_model"
+        loaded_data = rasa.utils.io.pickle_load(
+            model_path / f"{cls._metadata_filename()}.data_example.pkl"
         )
-        label_data = io_utils.pickle_load(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.label_data.pkl"
+        label_data = rasa.utils.io.pickle_load(
+            model_path / f"{cls._metadata_filename()}.label_data.pkl"
         )
-        fake_features = io_utils.pickle_load(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.fake_features.pkl"
+        fake_features = rasa.utils.io.pickle_load(
+            model_path / f"{cls._metadata_filename()}.fake_features.pkl"
         )
         label_data = RasaModelData(data=label_data)
-        meta = io_utils.pickle_load(model_path / f"{SAVE_MODEL_FILE_NAME}.meta.pkl")
-        priority = io_utils.json_unpickle(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.priority.pkl"
+        priority = rasa.utils.io.json_unpickle(
+            model_path / f"{cls._metadata_filename()}.priority.pkl"
         )
         entity_tag_specs = rasa.shared.utils.io.read_json_file(
-            model_path / f"{SAVE_MODEL_FILE_NAME}.entity_tag_specs.json"
+            model_path / f"{cls._metadata_filename()}.entity_tag_specs.json"
         )
         entity_tag_specs = [
             EntityTagSpec(
@@ -805,57 +1007,168 @@ class TEDPolicy(Policy):
             )
             for tag_spec in entity_tag_specs
         ]
-
-        model_data_example = RasaModelData(
-            label_key=LABEL_KEY, label_sub_key=LABEL_SUB_KEY, data=loaded_data
+        model_config = rasa.utils.io.pickle_load(
+            model_path / f"{cls._metadata_filename()}.meta.pkl"
         )
-        meta = rasa.utils.train_utils.override_defaults(cls.defaults, meta)
-        meta = rasa.utils.train_utils.update_confidence_type(meta)
-        meta = rasa.utils.train_utils.update_similarity_type(meta)
-        meta = rasa.utils.train_utils.update_deprecated_loss_type(meta)
 
-        meta[EPOCHS] = epoch_override
+        return {
+            "tf_model_file": tf_model_file,
+            "loaded_data": loaded_data,
+            "fake_features": fake_features,
+            "label_data": label_data,
+            "priority": priority,
+            "entity_tag_specs": entity_tag_specs,
+            "model_config": model_config,
+        }
 
-        model = TED.load(
-            str(tf_model_file),
+    @classmethod
+    def load(
+        cls,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+        **kwargs: Any,
+    ) -> TEDPolicy:
+        """Loads a policy from the storage (see parent class for full docstring)."""
+        try:
+            with model_storage.read_from(resource) as model_path:
+                return cls._load(
+                    model_path, config, model_storage, resource, execution_context
+                )
+        except ValueError:
+            logger.debug(
+                f"Failed to load {cls.__class__.__name__} from model storage. Resource "
+                f"'{resource.name}' doesn't exist."
+            )
+            return cls(config, model_storage, resource, execution_context)
+
+    @classmethod
+    def _load(
+        cls,
+        model_path: Path,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+    ) -> TEDPolicy:
+        featurizer = TrackerFeaturizer.load(model_path)
+
+        if not (model_path / f"{cls._metadata_filename()}.data_example.pkl").is_file():
+            return cls(
+                config,
+                model_storage,
+                resource,
+                execution_context,
+                featurizer=featurizer,
+            )
+
+        model_utilities = cls._load_model_utilities(model_path)
+
+        config = cls._update_loaded_params(config)
+        if execution_context.is_finetuning and EPOCH_OVERRIDE in config:
+            config[EPOCHS] = config.get(EPOCH_OVERRIDE)
+
+        (
             model_data_example,
+            predict_data_example,
+        ) = cls._construct_model_initialization_data(model_utilities["loaded_data"])
+
+        model = cls._load_tf_model(
+            model_utilities,
+            model_data_example,
+            predict_data_example,
+            featurizer,
+            execution_context.is_finetuning,
+        )
+
+        return cls._load_policy_with_model(
+            config,
+            model_storage,
+            resource,
+            execution_context,
+            featurizer=featurizer,
+            model_utilities=model_utilities,
+            model=model,
+        )
+
+    @classmethod
+    def _load_policy_with_model(
+        cls,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+        featurizer: TrackerFeaturizer,
+        model: TED,
+        model_utilities: Dict[Text, Any],
+    ) -> TEDPolicy:
+        return cls(
+            config,
+            model_storage,
+            resource,
+            execution_context,
+            model=model,
+            featurizer=featurizer,
+            fake_features=model_utilities["fake_features"],
+            entity_tag_specs=model_utilities["entity_tag_specs"],
+        )
+
+    @classmethod
+    def _load_tf_model(
+        cls,
+        model_utilities: Dict[Text, Any],
+        model_data_example: RasaModelData,
+        predict_data_example: RasaModelData,
+        featurizer: TrackerFeaturizer,
+        should_finetune: bool,
+    ) -> TED:
+        model = cls.model_class().load(
+            str(model_utilities["tf_model_file"]),
+            model_data_example,
+            predict_data_example,
             data_signature=model_data_example.get_signature(),
-            config=meta,
+            config=model_utilities["model_config"],
             max_history_featurizer_is_used=isinstance(
                 featurizer, MaxHistoryTrackerFeaturizer
             ),
-            label_data=label_data,
-            entity_tag_specs=entity_tag_specs,
+            label_data=model_utilities["label_data"],
+            entity_tag_specs=model_utilities["entity_tag_specs"],
             finetune_mode=should_finetune,
         )
+        return model
 
-        if not should_finetune:
-            # build the graph for prediction
-            predict_data_example = RasaModelData(
-                label_key=LABEL_KEY,
-                label_sub_key=LABEL_SUB_KEY,
-                data={
-                    feature_name: features
-                    for feature_name, features in model_data_example.items()
-                    if feature_name
-                    # we need to remove label features for prediction if they are present
-                    in PREDICTION_FEATURES
-                },
-            )
-            model.build_for_predict(predict_data_example)
-
-        return cls(
-            featurizer=featurizer,
-            priority=priority,
-            model=model,
-            fake_features=fake_features,
-            entity_tag_specs=entity_tag_specs,
-            should_finetune=should_finetune,
-            **meta,
+    @classmethod
+    def _construct_model_initialization_data(
+        cls, loaded_data: Dict[Text, Dict[Text, List[FeatureArray]]]
+    ) -> Tuple[RasaModelData, RasaModelData]:
+        model_data_example = RasaModelData(
+            label_key=LABEL_KEY, label_sub_key=LABEL_SUB_KEY, data=loaded_data
         )
+        predict_data_example = RasaModelData(
+            label_key=LABEL_KEY,
+            label_sub_key=LABEL_SUB_KEY,
+            data={
+                feature_name: features
+                for feature_name, features in model_data_example.items()
+                if feature_name
+                # we need to remove label features for prediction if they are present
+                in PREDICTION_FEATURES
+            },
+        )
+        return model_data_example, predict_data_example
+
+    @classmethod
+    def _update_loaded_params(cls, meta: Dict[Text, Any]) -> Dict[Text, Any]:
+        meta = rasa.utils.train_utils.update_confidence_type(meta)
+        meta = rasa.utils.train_utils.update_similarity_type(meta)
+
+        return meta
 
 
 class TED(TransformerRasaModel):
+    """TED model architecture from https://arxiv.org/abs/1910.00486."""
+
     def __init__(
         self,
         data_signature: Dict[Text, Dict[Text, List[FeatureSignature]]],
@@ -864,7 +1177,7 @@ class TED(TransformerRasaModel):
         label_data: RasaModelData,
         entity_tag_specs: Optional[List[EntityTagSpec]],
     ) -> None:
-        """Intializes the TED model.
+        """Initializes the TED model.
 
         Args:
             data_signature: the data signature of the input data
@@ -886,9 +1199,6 @@ class TED(TransformerRasaModel):
 
         self._entity_tag_specs = entity_tag_specs
 
-        # optimizer
-        self.optimizer = tf.keras.optimizers.Adam()
-
         # metrics
         self.action_loss = tf.keras.metrics.Mean(name="loss")
         self.action_acc = tf.keras.metrics.Mean(name="acc")
@@ -905,7 +1215,7 @@ class TED(TransformerRasaModel):
 
     def _check_data(self) -> None:
         if not any(key in [INTENT, TEXT] for key in self.data_signature.keys()):
-            raise ValueError(
+            raise RasaException(
                 f"No user features specified. "
                 f"Cannot train '{self.__class__.__name__}' model."
             )
@@ -927,23 +1237,25 @@ class TED(TransformerRasaModel):
 
     def _prepare_layers(self) -> None:
         for name in self.data_signature.keys():
-            self._prepare_sparse_dense_layer_for(name, self.data_signature)
-            if name in SEQUENCE_FEATURES_TO_ENCODE:
-                self._prepare_sequence_layers(name)
+            self._prepare_input_layers(
+                name, self.data_signature[name], is_label_attribute=False
+            )
             self._prepare_encoding_layers(name)
 
         for name in self.label_signature.keys():
-            self._prepare_sparse_dense_layer_for(name, self.label_signature)
-            if name in SEQUENCE_FEATURES_TO_ENCODE:
-                self._prepare_sequence_layers(name)
+            self._prepare_input_layers(
+                name, self.label_signature[name], is_label_attribute=True
+            )
             self._prepare_encoding_layers(name)
 
-        self._prepare_transformer_layer(
-            DIALOGUE,
-            self.config[NUM_TRANSFORMER_LAYERS][DIALOGUE],
-            self.config[TRANSFORMER_SIZE][DIALOGUE],
-            self.config[DROP_RATE_DIALOGUE],
-            self.config[DROP_RATE_ATTENTION],
+        self._tf_layers[
+            f"transformer.{DIALOGUE}"
+        ] = rasa_layers.prepare_transformer_layer(
+            attribute_name=DIALOGUE,
+            config=self.config,
+            num_layers=self.config[NUM_TRANSFORMER_LAYERS][DIALOGUE],
+            units=self.config[TRANSFORMER_SIZE][DIALOGUE],
+            drop_rate=self.config[DROP_RATE_DIALOGUE],
             # use bidirectional transformer, because
             # we will invert dialogue sequence so that the last turn is located
             # at the first position and would always have
@@ -951,45 +1263,54 @@ class TED(TransformerRasaModel):
             unidirectional=not self.max_history_featurizer_is_used,
         )
 
-        self._prepare_embed_layers(DIALOGUE)
-        self._prepare_embed_layers(LABEL)
-
-        self._prepare_dot_product_loss(LABEL, self.config[SCALE_LOSS])
+        self._prepare_label_classification_layers(DIALOGUE)
 
         if self.config[ENTITY_RECOGNITION]:
             self._prepare_entity_recognition_layers()
 
-    def _prepare_sparse_dense_layer_for(
-        self, name: Text, signature: Dict[Text, Dict[Text, List[FeatureSignature]]]
+    def _prepare_input_layers(
+        self,
+        attribute_name: Text,
+        attribute_signature: Dict[Text, List[FeatureSignature]],
+        is_label_attribute: bool = False,
     ) -> None:
-        """Prepares the sparse dense layer for the given attribute name.
+        """Prepares feature processing layers for sentence/sequence-level features.
 
-        It is used to combine the sparse and dense features of the attribute at the
-        beginning of the model.
-
-        Args:
-            name: the attribute name
-            signature: data signature
+        Distinguishes between label features and other features, not applying input
+        dropout to the label ones.
         """
-        for feature_type in VALID_FEATURE_TYPES:
-            if feature_type not in signature[name]:
-                # features for feature type are not present
-                continue
-
-            self._prepare_sparse_dense_dropout_layers(
-                f"{name}_{feature_type}", self.config[DROP_RATE]
+        # Disable input dropout in the config to be used if this is a label attribute.
+        if is_label_attribute:
+            config_to_use = self.config.copy()
+            config_to_use.update(
+                {SPARSE_INPUT_DROPOUT: False, DENSE_INPUT_DROPOUT: False}
             )
-
-            # use the same configurable dense dimension for all sparse features
-            self._prepare_sparse_dense_layers(
-                signature[name][feature_type],
-                f"{name}_{feature_type}",
-                self.config[DENSE_DIMENSION][name],
+        else:
+            config_to_use = self.config
+        # Attributes with sequence-level features also have sentence-level features,
+        # all these need to be combined and further processed.
+        if attribute_name in SEQUENCE_FEATURES_TO_ENCODE:
+            self._tf_layers[
+                f"sequence_layer.{attribute_name}"
+            ] = rasa_layers.RasaSequenceLayer(
+                attribute_name, attribute_signature, config_to_use
+            )
+        # Attributes without sequence-level features require some actual feature
+        # processing only if they have sentence-level features. Attributes with no
+        # sequence- and sentence-level features (dialogue, entity_tags, label) are
+        # skipped here.
+        elif SENTENCE in attribute_signature:
+            self._tf_layers[
+                f"sparse_dense_concat_layer.{attribute_name}"
+            ] = rasa_layers.ConcatenateSparseDenseFeatures(
+                attribute=attribute_name,
+                feature_type=SENTENCE,
+                feature_type_signature=attribute_signature[SENTENCE],
+                config=config_to_use,
             )
 
     def _prepare_encoding_layers(self, name: Text) -> None:
-        """Create ffnn layer for given attribute name. The layer is used just before
-        all dialogue features are combined.
+        """Create Ffnn encoding layer used just before combining all dialogue features.
 
         Args:
             name: attribute name
@@ -1048,17 +1369,7 @@ class TED(TransformerRasaModel):
                 )
                 all_labels_encoded[key] = attribute_features
 
-        if (
-            all_labels_encoded.get(f"{LABEL_KEY}_{ACTION_TEXT}") is not None
-            and all_labels_encoded.get(f"{LABEL_KEY}_{ACTION_NAME}") is not None
-        ):
-            x = all_labels_encoded.pop(
-                f"{LABEL_KEY}_{ACTION_TEXT}"
-            ) + all_labels_encoded.pop(f"{LABEL_KEY}_{ACTION_NAME}")
-        elif all_labels_encoded.get(f"{LABEL_KEY}_{ACTION_TEXT}") is not None:
-            x = all_labels_encoded.pop(f"{LABEL_KEY}_{ACTION_TEXT}")
-        else:
-            x = all_labels_encoded.pop(f"{LABEL_KEY}_{ACTION_NAME}")
+        x = self._collect_label_attribute_encodings(all_labels_encoded)
 
         # additional sequence axis is artifact of our RasaModelData creation
         # TODO check whether this should be solved in data creation
@@ -1067,6 +1378,20 @@ class TED(TransformerRasaModel):
         all_labels_embed = self._tf_layers[f"embed.{LABEL}"](x)
 
         return all_label_ids, all_labels_embed
+
+    @staticmethod
+    def _collect_label_attribute_encodings(
+        all_labels_encoded: Dict[Text, tf.Tensor]
+    ) -> tf.Tensor:
+        # Initialize with at least one attribute first
+        # so that the subsequent TF ops are simplified.
+        all_attributes_present = list(all_labels_encoded.keys())
+        x = all_labels_encoded.pop(all_attributes_present[0])
+
+        # Add remaining attributes
+        for attribute in all_labels_encoded:
+            x += all_labels_encoded.get(attribute)
+        return x
 
     def _embed_dialogue(
         self,
@@ -1084,7 +1409,7 @@ class TED(TransformerRasaModel):
             also the attention weights.
         """
         dialogue_lengths = tf.cast(tf_batch_data[DIALOGUE][LENGTH][0], tf.int32)
-        mask = self._compute_mask(dialogue_lengths)
+        mask = rasa_layers.compute_mask(dialogue_lengths)
 
         if self.max_history_featurizer_is_used:
             # invert dialogue sequence so that the last turn would always have
@@ -1094,7 +1419,7 @@ class TED(TransformerRasaModel):
         dialogue_transformed, attention_weights = self._tf_layers[
             f"transformer.{DIALOGUE}"
         ](dialogue_in, 1 - mask, self._training)
-        dialogue_transformed = tfa.activations.gelu(dialogue_transformed)
+        dialogue_transformed = tf.nn.gelu(dialogue_transformed)
 
         if self.max_history_featurizer_is_used:
             # pick last vector if max history featurizer is used, since we inverted
@@ -1139,81 +1464,65 @@ class TED(TransformerRasaModel):
             lambda: self._encode_fake_features_per_attribute(tf_batch_data, attribute),
         )
 
-    def _get_dense_units(
-        self, attribute_features_list: List[tf.Tensor], attribute: Text
-    ) -> int:
-        # TODO this should be done in corresponding layers once in init
-        units = 0
-        for f in attribute_features_list:
-            if isinstance(f, tf.SparseTensor):
-                units += self.config[DENSE_DIMENSION][attribute]
-            else:
-                units += f.shape[-1]
-        return units
-
-    def _get_concat_units(
-        self, tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]], attribute: Text
-    ) -> int:
-        # TODO this should be done in corresponding layers once in init
-        # calculate concat sequence sentence dim
-        sentence_units = self._get_dense_units(
-            tf_batch_data[attribute][SENTENCE], attribute
-        )
-        sequence_units = self._get_dense_units(
-            tf_batch_data[attribute][SEQUENCE], attribute
-        )
-
-        if sequence_units and not sentence_units:
-            return sequence_units
-
-        if sentence_units and not sequence_units:
-            return sentence_units
-
-        if sentence_units != sequence_units:
-            return self.config[CONCAT_DIMENSION][TEXT]
-
-        return sentence_units
-
     def _encode_fake_features_per_attribute(
         self, tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]], attribute: Text
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Returns dummy outputs for fake features of a given attribute.
+
+        Needs to match the outputs of `_encode_real_features_per_attribute` in shape
+        but these outputs will be filled with zeros.
+
+        Args:
+            tf_batch_data: Maps each attribute to its features and masks.
+            attribute: The attribute whose fake features will be "processed", e.g.
+                `ACTION_NAME`, `INTENT`.
+
+        Returns:
+            attribute_features: A tensor of shape `(batch_size, dialogue_length, units)`
+                filled with zeros.
+            text_output: Only for `TEXT` attribute (otherwise an empty tensor): A tensor
+                of shape `(combined batch_size & dialogue_length, max seq length,
+                units)` filled with zeros.
+            text_sequence_lengths: Only for `TEXT` attribute, otherwise an empty tensor:
+                Of hape `(combined batch_size & dialogue_length, 1)`, filled with zeros.
+        """
         # we need to create real zero tensors with appropriate batch and dialogue dim
         # because they are passed to dialogue transformer
         attribute_mask = tf_batch_data[attribute][MASK][0]
 
+        # determine all dimensions so that fake features of the correct shape can be
+        # created
         batch_dim = tf.shape(attribute_mask)[0]
         dialogue_dim = tf.shape(attribute_mask)[1]
         if attribute in set(SENTENCE_FEATURES_TO_ENCODE + LABEL_FEATURES_TO_ENCODE):
             units = self.config[ENCODING_DIMENSION]
         else:
-            units = self._get_dense_units(tf_batch_data[attribute][SENTENCE], attribute)
+            # state-level attributes don't use an encoding layer, hence their size is
+            # just the output size of the corresponding sparse+dense feature combining
+            # layer
+            units = self._tf_layers[
+                f"sparse_dense_concat_layer.{attribute}"
+            ].output_units
 
         attribute_features = tf.zeros(
             (batch_dim, dialogue_dim, units), dtype=tf.float32
         )
-        if attribute == TEXT:
-            # if the input features are fake, we don't process them further,
-            # but we need to calculate correct last dim (units) so that tf could infer
-            # the last shape of the tensors
-            if self.config[NUM_TRANSFORMER_LAYERS][TEXT] > 0:
-                text_transformer_units = self.config[TRANSFORMER_SIZE][TEXT]
-            elif self.config[HIDDEN_LAYERS_SIZES][TEXT]:
-                text_transformer_units = self.config[HIDDEN_LAYERS_SIZES][TEXT][-1]
-            else:
-                text_transformer_units = self._get_concat_units(
-                    tf_batch_data, attribute
-                )
 
-            text_transformer_output = tf.zeros(
-                (0, 0, text_transformer_units), dtype=tf.float32
-            )
-            text_sequence_lengths = tf.zeros((0, 1), dtype=tf.int32)
+        # Only for user text, the transformer output and sequence lengths also have to
+        # be created (here using fake features) to enable entity recognition training
+        # and prediction.
+        if attribute == TEXT:
+            # we just need to get the correct last dimension size from the prepared
+            # transformer
+            text_units = self._tf_layers[f"sequence_layer.{attribute}"].output_units
+            text_output = tf.zeros((0, 0, text_units), dtype=tf.float32)
+            text_sequence_lengths = tf.zeros((0,), dtype=tf.int32)
         else:
             # simulate None with empty tensor of zeros
-            text_transformer_output = tf.zeros((0,))
+            text_output = tf.zeros((0,))
             text_sequence_lengths = tf.zeros((0,))
 
-        return attribute_features, text_transformer_output, text_sequence_lengths
+        return attribute_features, text_output, text_sequence_lengths
 
     @staticmethod
     def _create_last_dialogue_turns_mask(
@@ -1267,50 +1576,61 @@ class TED(TransformerRasaModel):
         """Encodes features for a given attribute.
 
         Args:
-            tf_batch_data: dictionary mapping every attribute to its features and masks
+            tf_batch_data: Maps each attribute to its features and masks.
             attribute: the attribute we will encode features for
                 (e.g., ACTION_NAME, INTENT)
 
         Returns:
-            A tensor combining  all features for `attribute`
+            attribute_features: A tensor of shape `(batch_size, dialogue_length, units)`
+                with all features for `attribute` processed and combined. If sequence-
+                level features are present, the sequence dimension is eliminated using
+                a transformer.
+            text_output: Only for `TEXT` attribute (otherwise an empty tensor): A tensor
+                of shape `(combined batch_size & dialogue_length, max seq length,
+                units)` containing token-level embeddings further used for entity
+                extraction from user text. Similar to `attribute_features` but returned
+                for all tokens, not just for the last one.
+            text_sequence_lengths: Only for `TEXT` attribute, otherwise an empty tensor:
+                Shape `(combined batch_size & dialogue_length, 1)`, containing the
+                sequence length for user text examples in `text_output`. The sequence
+                length is effectively the number of tokens + 1 (to account also for
+                sentence-level features). Needed for entity extraction from user text.
         """
         # simulate None with empty tensor of zeros
-        text_transformer_output = tf.zeros((0,))
+        text_output = tf.zeros((0,))
         text_sequence_lengths = tf.zeros((0,))
 
         if attribute in SEQUENCE_FEATURES_TO_ENCODE:
-            # sequence_lengths contain `0` for "fake" features, while
-            # tf_batch_data[attribute] contain only "real" features
-            sequence_lengths = tf_batch_data[attribute][SEQUENCE_LENGTH][0]
-            # extract only nonzero lengths and cast to int
-            sequence_lengths = tf.cast(
-                tf.boolean_mask(sequence_lengths, sequence_lengths), dtype=tf.int32
-            )
-            # boolean mask returns flat tensor
-            sequence_lengths = tf.expand_dims(sequence_lengths, axis=-1)
-
-            mask_sequence_text = tf.squeeze(
-                self._compute_mask(sequence_lengths), axis=1
-            )
-            # add 1 to sequence lengths to account for sentence features
-            sequence_lengths += 1
-            mask_text = tf.squeeze(self._compute_mask(sequence_lengths), axis=1)
-
-            attribute_features, _, _, _, _ = self._create_sequence(
-                tf_batch_data[attribute][SEQUENCE],
-                tf_batch_data[attribute][SENTENCE],
-                mask_sequence_text,
-                mask_text,
-                attribute,
-                sparse_dropout=self.config[SPARSE_INPUT_DROPOUT],
-                dense_dropout=self.config[DENSE_INPUT_DROPOUT],
-                masked_lm_loss=self.config[MASKED_LM],
-                sequence_ids=False,
+            # get lengths of real token sequences as a 3D tensor
+            sequence_feature_lengths = self._get_sequence_feature_lengths(
+                tf_batch_data, attribute
             )
 
+            # sequence_feature_lengths contain `0` for "fake" features, while
+            # tf_batch_data[attribute] contains only "real" features. Hence, we need to
+            # get rid of the lengths that are 0. This step produces a 1D tensor.
+            sequence_feature_lengths = tf.boolean_mask(
+                sequence_feature_lengths, sequence_feature_lengths
+            )
+
+            attribute_features, _, _, _, _, _ = self._tf_layers[
+                f"sequence_layer.{attribute}"
+            ](
+                (
+                    tf_batch_data[attribute][SEQUENCE],
+                    tf_batch_data[attribute][SENTENCE],
+                    sequence_feature_lengths,
+                ),
+                training=self._training,
+            )
+
+            combined_sentence_sequence_feature_lengths = sequence_feature_lengths + 1
+
+            # Only for user text, the transformer output and sequence lengths also have
+            # to be returned to enable entity recognition training and prediction.
             if attribute == TEXT:
-                text_transformer_output = attribute_features
-                text_sequence_lengths = sequence_lengths
+                text_output = attribute_features
+                text_sequence_lengths = combined_sentence_sequence_feature_lengths
 
                 if self.max_history_featurizer_is_used:
                     # get the location of all last dialogue inputs
@@ -1318,9 +1638,7 @@ class TED(TransformerRasaModel):
                         tf_batch_data, attribute
                     )
                     # pick outputs that correspond to the last dialogue turns
-                    text_transformer_output = tf.boolean_mask(
-                        text_transformer_output, last_dialogue_turns_mask
-                    )
+                    text_output = tf.boolean_mask(text_output, last_dialogue_turns_mask)
                     text_sequence_lengths = tf.boolean_mask(
                         text_sequence_lengths, last_dialogue_turns_mask
                     )
@@ -1329,21 +1647,23 @@ class TED(TransformerRasaModel):
             # combined batch dimension and dialogue length x 1 x units
             attribute_features = tf.expand_dims(
                 self._last_token(
-                    attribute_features, tf.squeeze(sequence_lengths, axis=-1)
+                    attribute_features, combined_sentence_sequence_feature_lengths
                 ),
                 axis=1,
             )
 
+        # for attributes without sequence-level features, all we need is to combine the
+        # sparse and dense sentence-level features into one
         else:
             # resulting attribute features will have shape
             # combined batch dimension and dialogue length x 1 x units
-            attribute_features = self._combine_sparse_dense_features(
-                tf_batch_data[attribute][SENTENCE], f"{attribute}_{SENTENCE}"
-            )
+            attribute_features = self._tf_layers[
+                f"sparse_dense_concat_layer.{attribute}"
+            ]((tf_batch_data[attribute][SENTENCE],), training=self._training)
 
         if attribute in SENTENCE_FEATURES_TO_ENCODE + LABEL_FEATURES_TO_ENCODE:
             attribute_features = self._tf_layers[f"encoding_layer.{attribute}"](
-                attribute_features
+                attribute_features, self._training
             )
 
         # attribute features have shape
@@ -1354,7 +1674,7 @@ class TED(TransformerRasaModel):
             attribute_features, tf_batch_data, attribute
         )
 
-        return attribute_features, text_transformer_output, text_sequence_lengths
+        return attribute_features, text_output, text_sequence_lengths
 
     @staticmethod
     def _convert_to_original_shape(
@@ -1438,20 +1758,20 @@ class TED(TransformerRasaModel):
              Tensor: encoding of all features in the batch, combined;
         """
         # encode each attribute present in tf_batch_data
-        text_transformer_output = None
+        text_output = None
         text_sequence_lengths = None
         batch_encoded = {}
         for attribute in tf_batch_data.keys():
             if attribute in SENTENCE_FEATURES_TO_ENCODE + STATE_LEVEL_FEATURES:
                 (
                     attribute_features,
-                    _text_transformer_output,
+                    _text_output,
                     _text_sequence_lengths,
                 ) = self._encode_features_per_attribute(tf_batch_data, attribute)
 
                 batch_encoded[attribute] = attribute_features
                 if attribute == TEXT:
-                    text_transformer_output = _text_transformer_output
+                    text_output = _text_output
                     text_sequence_lengths = _text_sequence_lengths
 
         # if both action text and action name are present, combine them; otherwise,
@@ -1487,13 +1807,13 @@ class TED(TransformerRasaModel):
 
         batch_features = tf.concat(batch_features, axis=-1)
 
-        return batch_features, text_transformer_output, text_sequence_lengths
+        return batch_features, text_output, text_sequence_lengths
 
     def _reshape_for_entities(
         self,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
         dialogue_transformer_output: tf.Tensor,
-        text_transformer_output: tf.Tensor,
+        text_output: tf.Tensor,
         text_sequence_lengths: tf.Tensor,
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         # The first dim of the output of the text sequence transformer is the same
@@ -1534,7 +1854,7 @@ class TED(TransformerRasaModel):
         # broadcast the dialogue transformer output sequence-length-times to get the
         # same shape as the text sequence transformer output
         dialogue_transformer_output = tf.tile(
-            dialogue_transformer_output, (1, tf.shape(text_transformer_output)[1], 1)
+            dialogue_transformer_output, (1, tf.shape(text_output)[1], 1)
         )
 
         # concat the output of the dialogue transformer to the output of the text
@@ -1542,10 +1862,10 @@ class TED(TransformerRasaModel):
         # resulting shape (N x sequence length x 2 units)
         # N = number of "real" features for `text` at the last dialogue turns
         text_transformed = tf.concat(
-            [text_transformer_output, dialogue_transformer_output], axis=-1
+            [text_output, dialogue_transformer_output], axis=-1
         )
+        text_mask = rasa_layers.compute_mask(text_sequence_lengths)
 
-        text_mask = tf.squeeze(self._compute_mask(text_sequence_lengths), axis=1)
         # add zeros to match the shape of text_transformed, because
         # max sequence length might differ, since it is calculated dynamically
         # based on a subset of sequence lengths
@@ -1563,21 +1883,21 @@ class TED(TransformerRasaModel):
         self,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
         dialogue_transformer_output: tf.Tensor,
-        text_transformer_output: tf.Tensor,
+        text_output: tf.Tensor,
         text_sequence_lengths: tf.Tensor,
     ) -> tf.Tensor:
         # It could happen that some batches don't contain "real" features for `text`,
         # e.g. large number of stories are intent only.
-        # Therefore actual `text_transformer_output` will be empty.
+        # Therefore actual `text_output` will be empty.
         # We cannot create a loss with empty tensors.
         # Since we need actual numbers to create a full loss, we output
         # zero in this case.
         return tf.cond(
-            tf.shape(text_transformer_output)[0] > 0,
+            tf.shape(text_output)[0] > 0,
             lambda: self._real_batch_loss_entities(
                 tf_batch_data,
                 dialogue_transformer_output,
-                text_transformer_output,
+                text_output,
                 text_sequence_lengths,
             ),
             lambda: tf.constant(0.0),
@@ -1587,14 +1907,14 @@ class TED(TransformerRasaModel):
         self,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
         dialogue_transformer_output: tf.Tensor,
-        text_transformer_output: tf.Tensor,
+        text_output: tf.Tensor,
         text_sequence_lengths: tf.Tensor,
     ) -> tf.Tensor:
 
         text_transformed, text_mask, text_sequence_lengths = self._reshape_for_entities(
             tf_batch_data,
             dialogue_transformer_output,
-            text_transformer_output,
+            text_output,
             text_sequence_lengths,
         )
 
@@ -1647,11 +1967,9 @@ class TED(TransformerRasaModel):
         label_ids = tf_batch_data[LABEL_KEY][LABEL_SUB_KEY][0]
         labels_embed = self._get_labels_embed(label_ids, all_labels_embed)
 
-        (
-            dialogue_in,
-            text_transformer_output,
-            text_sequence_lengths,
-        ) = self._process_batch_data(tf_batch_data)
+        dialogue_in, text_output, text_sequence_lengths = self._process_batch_data(
+            tf_batch_data
+        )
         (
             dialogue_embed,
             dialogue_mask,
@@ -1674,14 +1992,14 @@ class TED(TransformerRasaModel):
 
         if (
             self.config[ENTITY_RECOGNITION]
-            and text_transformer_output is not None
+            and text_output is not None
             and text_sequence_lengths is not None
         ):
             losses.append(
                 self._batch_loss_entities(
                     tf_batch_data,
                     dialogue_transformer_output,
-                    text_transformer_output,
+                    text_output,
                     text_sequence_lengths,
                 )
             )
@@ -1692,14 +2010,13 @@ class TED(TransformerRasaModel):
         return tf.math.add_n(losses)
 
     # ---PREDICTION---
-
     def prepare_for_predict(self) -> None:
         """Prepares the model for prediction."""
         _, self.all_labels_embed = self._create_all_labels_embed()
 
     def batch_predict(
         self, batch_in: Union[Tuple[tf.Tensor], Tuple[np.ndarray]]
-    ) -> Dict[Text, tf.Tensor]:
+    ) -> Dict[Text, Union[tf.Tensor, Dict[Text, tf.Tensor]]]:
         """Predicts the output of the given batch.
 
         Args:
@@ -1719,11 +2036,9 @@ class TED(TransformerRasaModel):
         )
         self._compute_dialogue_indices(tf_batch_data)
 
-        (
-            dialogue_in,
-            text_transformer_output,
-            text_sequence_lengths,
-        ) = self._process_batch_data(tf_batch_data)
+        dialogue_in, text_output, text_sequence_lengths = self._process_batch_data(
+            tf_batch_data
+        )
         (
             dialogue_embed,
             dialogue_mask,
@@ -1734,27 +2049,27 @@ class TED(TransformerRasaModel):
 
         sim_all, scores = self._tf_layers[
             f"loss.{LABEL}"
-        ].similarity_confidence_from_embeddings(
+        ].get_similarities_and_confidences_from_embeddings(
             dialogue_embed[:, :, tf.newaxis, :],
             self.all_labels_embed[tf.newaxis, tf.newaxis, :, :],
             dialogue_mask,
         )
 
         predictions = {
-            "action_scores": scores,
+            "scores": scores,
             "similarities": sim_all,
             DIAGNOSTIC_DATA: {"attention_weights": attention_weights},
         }
 
         if (
             self.config[ENTITY_RECOGNITION]
-            and text_transformer_output is not None
+            and text_output is not None
             and text_sequence_lengths is not None
         ):
             pred_ids, confidences = self._batch_predict_entities(
                 tf_batch_data,
                 dialogue_transformer_output,
-                text_transformer_output,
+                text_output,
                 text_sequence_lengths,
             )
             name = ENTITY_ATTRIBUTE_TYPE
@@ -1767,27 +2082,27 @@ class TED(TransformerRasaModel):
         self,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
         dialogue_transformer_output: tf.Tensor,
-        text_transformer_output: tf.Tensor,
+        text_output: tf.Tensor,
         text_sequence_lengths: tf.Tensor,
     ) -> Tuple[tf.Tensor, tf.Tensor]:
         # It could happen that current prediction turn don't contain
         # "real" features for `text`,
-        # Therefore actual `text_transformer_output` will be empty.
+        # Therefore actual `text_output` will be empty.
         # We cannot predict entities with empty tensors.
         # Since we need to output some tensors of the same shape, we output
         # zero tensors.
         return tf.cond(
-            tf.shape(text_transformer_output)[0] > 0,
+            tf.shape(text_output)[0] > 0,
             lambda: self._real_batch_predict_entities(
                 tf_batch_data,
                 dialogue_transformer_output,
-                text_transformer_output,
+                text_output,
                 text_sequence_lengths,
             ),
             lambda: (
                 # the output is of shape (batch_size, max_seq_len)
-                tf.zeros(tf.shape(text_transformer_output)[:2], dtype=tf.int32),
-                tf.zeros(tf.shape(text_transformer_output)[:2], dtype=tf.float32),
+                tf.zeros(tf.shape(text_output)[:2], dtype=tf.int32),
+                tf.zeros(tf.shape(text_output)[:2], dtype=tf.float32),
             ),
         )
 
@@ -1795,14 +2110,14 @@ class TED(TransformerRasaModel):
         self,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
         dialogue_transformer_output: tf.Tensor,
-        text_transformer_output: tf.Tensor,
+        text_output: tf.Tensor,
         text_sequence_lengths: tf.Tensor,
     ) -> Tuple[tf.Tensor, tf.Tensor]:
 
         text_transformed, _, text_sequence_lengths = self._reshape_for_entities(
             tf_batch_data,
             dialogue_transformer_output,
-            text_transformer_output,
+            text_output,
             text_sequence_lengths,
         )
 
@@ -1811,6 +2126,3 @@ class TED(TransformerRasaModel):
         _logits = self._tf_layers[f"embed.{name}.logits"](text_transformed)
 
         return self._tf_layers[f"crf.{name}"](_logits, text_sequence_lengths)
-
-
-# pytype: enable=key-error

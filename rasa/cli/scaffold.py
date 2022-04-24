@@ -5,15 +5,14 @@ from typing import List, Text
 
 from rasa import telemetry
 from rasa.cli import SubParsersAction
-import rasa.train
 from rasa.cli.shell import shell
-from rasa.cli.utils import create_output_path
 from rasa.shared.utils.cli import print_success, print_error_and_exit
 from rasa.shared.constants import (
     DOCS_BASE_URL,
     DEFAULT_CONFIG_PATH,
     DEFAULT_DOMAIN_PATH,
     DEFAULT_DATA_PATH,
+    DEFAULT_MODELS_PATH,
 )
 
 
@@ -47,8 +46,10 @@ def add_subparser(
     scaffold_parser.set_defaults(func=run)
 
 
-def print_train_or_instructions(args: argparse.Namespace, path: Text) -> None:
+def print_train_or_instructions(args: argparse.Namespace) -> None:
+    """Train a model if the user wants to."""
     import questionary
+    import rasa
 
     print_success("Finished creating project structure.")
 
@@ -60,12 +61,12 @@ def print_train_or_instructions(args: argparse.Namespace, path: Text) -> None:
 
     if should_train:
         print_success("Training an initial model...")
-        config = os.path.join(path, DEFAULT_CONFIG_PATH)
-        training_files = os.path.join(path, DEFAULT_DATA_PATH)
-        domain = os.path.join(path, DEFAULT_DOMAIN_PATH)
-        output = os.path.join(path, create_output_path())
-
-        training_result = rasa.train(domain, config, training_files, output)
+        training_result = rasa.train(
+            DEFAULT_DOMAIN_PATH,
+            DEFAULT_CONFIG_PATH,
+            DEFAULT_DATA_PATH,
+            DEFAULT_MODELS_PATH,
+        )
         args.model = training_result.model
 
         print_run_or_instructions(args)
@@ -124,12 +125,15 @@ def print_run_or_instructions(args: argparse.Namespace) -> None:
 
 
 def init_project(args: argparse.Namespace, path: Text) -> None:
-    create_initial_project(path)
-    print("Created project directory at '{}'.".format(os.path.abspath(path)))
-    print_train_or_instructions(args, path)
+    """Inits project."""
+    os.chdir(path)
+    create_initial_project(".")
+    print(f"Created project directory at '{os.getcwd()}'.")
+    print_train_or_instructions(args)
 
 
 def create_initial_project(path: Text) -> None:
+    """Creates directory structure and templates for initial project."""
     from distutils.dir_util import copy_tree
 
     copy_tree(scaffold_path(), path)
@@ -204,7 +208,7 @@ def run(args: argparse.Namespace) -> None:
         path = (
             questionary.text(
                 "Please enter a path where the project will be "
-                "created [default: current directory]",
+                "created [default: current directory]"
             )
             .skip_if(args.no_prompt, default="")
             .ask()

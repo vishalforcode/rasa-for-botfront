@@ -1,41 +1,20 @@
-import argparse
 import json
 import logging
 import os
-import re
-import sys
-from asyncio import Future
 from decimal import Decimal
-from hashlib import md5, sha1
 from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    List,
-    Optional,
-    Set,
-    Text,
-    Tuple,
-    Union,
-)
+from typing import Any, Dict, Optional, Set, Text, Tuple, Union
 
-import aiohttp
 import numpy as np
 
 import rasa.shared.utils.io
-import rasa.utils.io as io_utils
-from aiohttp import InvalidURL
 from rasa.constants import DEFAULT_SANIC_WORKERS, ENV_SANIC_WORKERS
-from rasa.shared.constants import DEFAULT_ENDPOINTS_PATH
+from rasa.shared.constants import DEFAULT_ENDPOINTS_PATH, TCP_PROTOCOL
 
-# backwards compatibility 1.0.x
-# noinspection PyUnresolvedReferences
 from rasa.core.lock_store import LockStore, RedisLockStore, InMemoryLockStore
 from rasa.utils.endpoints import EndpointConfig, read_endpoint_config
 from sanic import Sanic
-from sanic.views import CompositionView
+from socket import SOCK_DGRAM, SOCK_STREAM
 import rasa.cli.utils as cli_utils
 
 
@@ -43,36 +22,42 @@ logger = logging.getLogger(__name__)
 
 
 def configure_file_logging(
-    logger_obj: logging.Logger, log_file: Optional[Text]
+    logger_obj: logging.Logger,
+    log_file: Optional[Text],
+    use_syslog: Optional[bool],
+    syslog_address: Optional[Text] = None,
+    syslog_port: Optional[int] = None,
+    syslog_protocol: Optional[Text] = None,
 ) -> None:
     """Configure logging to a file.
 
     Args:
         logger_obj: Logger object to configure.
         log_file: Path of log file to write to.
+        use_syslog: Add syslog as a logger.
+        syslog_address: Adress of the syslog server.
+        syslog_port: Port of the syslog server.
+        syslog_protocol: Protocol with the syslog server
     """
-    if not log_file:
-        return
-
-    formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
-    file_handler = logging.FileHandler(
-        log_file, encoding=rasa.shared.utils.io.DEFAULT_ENCODING
-    )
-    file_handler.setLevel(logger_obj.level)
-    file_handler.setFormatter(formatter)
-    logger_obj.addHandler(file_handler)
-
-
-def is_int(value: Any) -> bool:
-    """Checks if a value is an integer.
-
-    The type of the value is not important, it might be an int or a float."""
-
-    # noinspection PyBroadException
-    try:
-        return value == int(value)
-    except Exception:
-        return False
+    if use_syslog:
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)-5.5s] [%(process)d]" " %(message)s"
+        )
+        socktype = SOCK_STREAM if syslog_protocol == TCP_PROTOCOL else SOCK_DGRAM
+        syslog_handler = logging.handlers.SysLogHandler(
+            address=(syslog_address, syslog_port), socktype=socktype
+        )
+        syslog_handler.setLevel(logger_obj.level)
+        syslog_handler.setFormatter(formatter)
+        logger_obj.addHandler(syslog_handler)
+    if log_file:
+        formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
+        file_handler = logging.FileHandler(
+            log_file, encoding=rasa.shared.utils.io.DEFAULT_ENCODING
+        )
+        file_handler.setLevel(logger_obj.level)
+        file_handler.setFormatter(formatter)
+        logger_obj.addHandler(file_handler)
 
 
 def one_hot(hot_idx: int, length: int, dtype: Optional[Text] = None) -> np.ndarray:
@@ -96,56 +81,6 @@ def one_hot(hot_idx: int, length: int, dtype: Optional[Text] = None) -> np.ndarr
     return r
 
 
-# noinspection PyPep8Naming
-class HashableNDArray:
-    """Hashable wrapper for ndarray objects.
-
-    Instances of ndarray are not hashable, meaning they cannot be added to
-    sets, nor used as keys in dictionaries. This is by design - ndarray
-    objects are mutable, and therefore cannot reliably implement the
-    __hash__() method.
-
-    The hashable class allows a way around this limitation. It implements
-    the required methods for hashable objects in terms of an encapsulated
-    ndarray object. This can be either a copied instance (which is safer)
-    or the original object (which requires the user to be careful enough
-    not to modify it)."""
-
-    def __init__(self, wrapped, tight=False) -> None:
-        """Creates a new hashable object encapsulating an ndarray.
-
-        wrapped
-            The wrapped ndarray.
-
-        tight
-            Optional. If True, a copy of the input ndaray is created.
-            Defaults to False.
-        """
-
-        self.__tight = tight
-        self.__wrapped = np.array(wrapped) if tight else wrapped
-        self.__hash = int(sha1(wrapped.view()).hexdigest(), 16)  # nosec
-
-    def __eq__(self, other) -> bool:
-        """Performs equality of the underlying array."""
-        return np.all(self.__wrapped == other.__wrapped)
-
-    def __hash__(self) -> int:
-        """Return the hash of the array."""
-        return self.__hash
-
-    def unwrap(self) -> np.ndarray:
-        """Returns the encapsulated ndarray.
-
-        If the wrapper is "tight", a copy of the encapsulated ndarray is
-        returned. Otherwise, the encapsulated ndarray itself is returned."""
-
-        if self.__tight:
-            return np.array(self.__wrapped)
-
-        return self.__wrapped
-
-
 def dump_obj_as_yaml_to_file(
     filename: Union[Text, Path], obj: Any, should_preserve_key_order: bool = False
 ) -> None:
@@ -161,38 +96,32 @@ def dump_obj_as_yaml_to_file(
     )
 
 
-def list_routes(app: Sanic):
-    """List all the routes of a sanic application.
-
-    Mainly used for debugging."""
+def list_routes(app: Sanic) -> Dict[Text, Text]:
+    """List all the routes of a sanic application. Mainly used for debugging."""
     from urllib.parse import unquote
 
     output = {}
 
-    def find_route(suffix, path):
+    def find_route(suffix: Text, path: Text) -> Optional[Text]:
         for name, (uri, _) in app.router.routes_names.items():
             if name.split(".")[-1] == suffix and uri == path:
                 return name
         return None
 
-    for endpoint, route in app.router.routes_all.items():
+    for route in app.router.routes:
+        endpoint = route.parts
         if endpoint[:-1] in app.router.routes_all and endpoint[-1] == "/":
             continue
 
         options = {}
-        for arg in route.parameters:
+        for arg in route._params:
             options[arg] = f"[{arg}]"
 
-        if not isinstance(route.handler, CompositionView):
-            handlers = [(list(route.methods)[0], route.name)]
-        else:
-            handlers = [
-                (method, find_route(v.__name__, endpoint) or v.__name__)
-                for method, v in route.handler.handlers.items()
-            ]
+        handlers = [(list(route.methods)[0], route.name.replace("rasa_server.", ""))]
 
         for method, name in handlers:
-            line = unquote(f"{endpoint:50s} {method:30s} {name}")
+            full_endpoint = "/" + "/".join(endpoint)
+            line = unquote(f"{full_endpoint:50s} {method:30s} {name}")
             output[name] = line
 
     url_table = "\n".join(output[url] for url in sorted(output))
@@ -219,7 +148,7 @@ def extract_args(
     return extracted, remaining
 
 
-def is_limit_reached(num_messages: int, limit: int) -> bool:
+def is_limit_reached(num_messages: int, limit: Optional[int]) -> bool:
     """Determine whether the number of messages has reached a limit.
 
     Args:
@@ -232,80 +161,10 @@ def is_limit_reached(num_messages: int, limit: int) -> bool:
     return limit is not None and num_messages >= limit
 
 
-def read_lines(
-    filename, max_line_limit=None, line_pattern=".*"
-) -> Generator[Text, Any, None]:
-    """Read messages from the command line and print bot responses."""
-
-    line_filter = re.compile(line_pattern)
-
-    with open(filename, "r", encoding=rasa.shared.utils.io.DEFAULT_ENCODING) as f:
-        num_messages = 0
-        for line in f:
-            m = line_filter.match(line)
-            if m is not None:
-                yield m.group(1 if m.lastindex else 0)
-                num_messages += 1
-
-            if is_limit_reached(num_messages, max_line_limit):
-                break
-
-
 def file_as_bytes(path: Text) -> bytes:
     """Read in a file as a byte array."""
     with open(path, "rb") as f:
         return f.read()
-
-
-def convert_bytes_to_string(data: Union[bytes, bytearray, Text]) -> Text:
-    """Convert `data` to string if it is a bytes-like object."""
-
-    if isinstance(data, (bytes, bytearray)):
-        return data.decode(rasa.shared.utils.io.DEFAULT_ENCODING)
-
-    return data
-
-
-def get_file_hash(path: Text) -> Text:
-    """Calculate the md5 hash of a file."""
-    return md5(file_as_bytes(path)).hexdigest()  # nosec
-
-
-async def download_file_from_url(url: Text) -> Text:
-    """Download a story file from a url and persists it into a temp file.
-
-    Args:
-        url: url to download from
-
-    Returns:
-        The file path of the temp file that contains the
-        downloaded content.
-    """
-    from rasa.nlu import utils as nlu_utils
-
-    if not nlu_utils.is_url(url):
-        raise InvalidURL(url)
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, raise_for_status=True) as resp:
-            filename = io_utils.create_temporary_file(await resp.read(), mode="w+b")
-
-    return filename
-
-
-def pad_lists_to_size(
-    list_x: List, list_y: List, padding_value: Optional[Any] = None
-) -> Tuple[List, List]:
-    """Compares list sizes and pads them to equal length."""
-
-    difference = len(list_x) - len(list_y)
-
-    if difference > 0:
-        return list_x, list_y + [padding_value] * difference
-    elif difference < 0:
-        return list_x + [padding_value] * (-difference), list_y
-    else:
-        return list_x, list_y
 
 
 class AvailableEndpoints:
@@ -361,46 +220,6 @@ def read_endpoints_from_path(
         endpoints_path, "endpoints", DEFAULT_ENDPOINTS_PATH, True
     )
     return AvailableEndpoints.read_endpoints(endpoints_config_path)
-
-
-# noinspection PyProtectedMember
-def set_default_subparser(parser, default_subparser) -> None:
-    """default subparser selection. Call after setup, just before parse_args()
-
-    parser: the name of the parser you're making changes to
-    default_subparser: the name of the subparser to call by default"""
-    subparser_found = False
-    for arg in sys.argv[1:]:
-        if arg in ["-h", "--help"]:  # global help if no subparser
-            break
-    else:
-        for x in parser._subparsers._actions:
-            if not isinstance(x, argparse._SubParsersAction):
-                continue
-            for sp_name in x._name_parser_map.keys():
-                if sp_name in sys.argv[1:]:
-                    subparser_found = True
-        if not subparser_found:
-            # insert default in first position before all other arguments
-            sys.argv.insert(1, default_subparser)
-
-
-def create_task_error_logger(error_message: Text = "") -> Callable[[Future], None]:
-    """Error logger to be attached to a task.
-
-    This will ensure exceptions are properly logged and won't get lost."""
-
-    def handler(fut: Future) -> None:
-        # noinspection PyBroadException
-        try:
-            fut.result()
-        except Exception:
-            logger.exception(
-                "An exception was raised while running task. "
-                "{}".format(error_message)
-            )
-
-    return handler
 
 
 def replace_floats_with_decimals(obj: Any, round_digits: int = 9) -> Any:
@@ -476,7 +295,7 @@ def number_of_sanic_workers(lock_store: Union[EndpointConfig, LockStore, None]) 
     `InMemoryLockStore`.
     """
 
-    def _log_and_get_default_number_of_workers():
+    def _log_and_get_default_number_of_workers() -> int:
         logger.debug(
             f"Using the default number of Sanic workers ({DEFAULT_SANIC_WORKERS})."
         )
@@ -507,6 +326,7 @@ def number_of_sanic_workers(lock_store: Union[EndpointConfig, LockStore, None]) 
 
     logger.debug(
         f"Unable to assign desired number of Sanic workers ({env_value}) as "
-        f"no `RedisLockStore` or custom `LockStore` endpoint configuration has been found."
+        f"no `RedisLockStore` or custom `LockStore` endpoint "
+        f"configuration has been found."
     )
     return _log_and_get_default_number_of_workers()

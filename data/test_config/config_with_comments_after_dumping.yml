@@ -1,4 +1,5 @@
 # here is some comment
+recipe: default.v1
 language: en
 
 # another comment
@@ -24,11 +25,13 @@ policies: # even here
 # # If you'd like to customize them, uncomment and adjust the policies.
 # # See https://rasa.com/docs/rasa/policies for more information.
 #   - name: MemoizationPolicy
+#   - name: RulePolicy
+#   - name: UnexpecTEDIntentPolicy
+#     max_history: 5
+#     epochs: 100
 #   - name: TEDPolicy
 #     max_history: 5
 #     epochs: 100
 #     constrain_similarities: true
-#     model_confidence: cosine
-#   - name: RulePolicy
 
 # comments everywhere

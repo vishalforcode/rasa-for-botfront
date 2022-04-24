@@ -1,8 +1,10 @@
-import asyncio
 from pathlib import Path
-from typing import Text, List
+from typing import Text, List, Dict, Any
+from unittest.mock import Mock
+from _pytest.monkeypatch import MonkeyPatch
 
 import pytest
+import numpy as np
 
 import rasa.shared.utils.io
 from rasa.shared.core.constants import USER_INTENT_OUT_OF_SCOPE
@@ -16,10 +18,12 @@ from rasa.shared.nlu.constants import (
     ENTITIES,
     INTENT,
     ACTION_NAME,
+    FEATURE_TYPE_SENTENCE,
 )
 from rasa.nlu.convert import convert_training_data
 from rasa.nlu.extractors.mitie_entity_extractor import MitieEntityExtractor
 from rasa.nlu.tokenizers.whitespace_tokenizer import WhitespaceTokenizer
+from rasa.shared.nlu.training_data.features import Features
 from rasa.shared.nlu.training_data.message import Message
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.loading import guess_format, UNK, load_data
@@ -52,7 +56,96 @@ def test_luis_data():
 def test_wit_data():
     td = load_data("data/examples/wit/demo-flights.json")
     assert not td.is_empty()
-    assert len(td.entity_examples) == 4
+    assert td.entity_examples == [
+        Message(
+            {
+                "intent": "flight_booking",
+                "entities": [
+                    {
+                        "entity": "location",
+                        "start": 19,
+                        "end": 25,
+                        "entities": [],
+                        "role": "from",
+                        "value": "london",
+                    }
+                ],
+                "text": "i want to fly from london",
+            }
+        ),
+        Message(
+            {
+                "intent": "flight_booking",
+                "entities": [
+                    {
+                        "entity": "location",
+                        "start": 17,
+                        "end": 23,
+                        "entities": [],
+                        "role": "to",
+                        "value": "berlin",
+                    }
+                ],
+                "text": "i want to fly to berlin",
+            }
+        ),
+        Message(
+            {
+                "intent": "flight_booking",
+                "entities": [
+                    {
+                        "entity": "location",
+                        "start": 18,
+                        "end": 24,
+                        "entities": [],
+                        "role": "from",
+                        "value": "berlin",
+                    },
+                    {
+                        "entity": "location",
+                        "start": 28,
+                        "end": 33,
+                        "entities": [],
+                        "role": "to",
+                        "value": "tokyo",
+                    },
+                ],
+                "text": "i want to go from berlin to tokyo tomorrow",
+            }
+        ),
+        Message(
+            {
+                "intent": "flight_booking",
+                "entities": [
+                    {
+                        "entity": "location",
+                        "start": 30,
+                        "end": 36,
+                        "entities": [],
+                        "role": "from",
+                        "value": "london",
+                    },
+                    {
+                        "entity": "wit$datetime",
+                        "start": 50,
+                        "end": 61,
+                        "entities": [],
+                        "role": "datetime",
+                        "value": "next monday",
+                    },
+                    {
+                        "entity": "location",
+                        "start": 40,
+                        "end": 49,
+                        "entities": [],
+                        "role": "to",
+                        "value": "amsterdam",
+                    },
+                ],
+                "text": "i'm looking for a flight from london to amsterdam next monday",
+            }
+        ),
+    ]
     assert len(td.intent_examples) == 5
     assert len(td.training_examples) == 5
     assert td.entity_synonyms == {}
@@ -96,30 +189,22 @@ def test_lookup_table_json():
     assert td_lookup.lookup_tables[0]["elements"] == lookup_fname
 
 
-def test_lookup_table_md():
-    lookup_fname = "data/test/lookup_tables/plates.txt"
-    td_lookup = load_data("data/test/lookup_tables/lookup_table.md")
+def test_lookup_table_yaml():
+    td_lookup = load_data("data/test/lookup_tables/lookup_table.yml")
     assert not td_lookup.is_empty()
     assert len(td_lookup.lookup_tables) == 1
     assert td_lookup.lookup_tables[0]["name"] == "plates"
-    assert td_lookup.lookup_tables[0]["elements"] == lookup_fname
+    assert len(td_lookup.lookup_tables[0]["elements"]) == 5
 
 
 def test_composite_entities_data():
-    td = load_data("data/test/demo-rasa-composite-entities.md")
+    td = load_data("data/test/demo-rasa-composite-entities.yml")
     assert not td.is_empty()
     assert len(td.entity_examples) == 11
-    assert len(td.intent_examples) == 45
-    assert len(td.training_examples) == 45
+    assert len(td.intent_examples) == 29
+    assert len(td.training_examples) == 29
     assert td.entity_synonyms == {"SF": "San Fransisco"}
-    assert td.intents == {
-        "order_pizza",
-        "book_flight",
-        "chitchat",
-        "greet",
-        "goodbye",
-        "affirm",
-    }
+    assert td.intents == {"order_pizza", "book_flight", "chitchat", "affirm"}
     assert td.entities == {"location", "topping", "size"}
     assert td.entity_groups == {"1", "2"}
     assert td.entity_roles == {"to", "from"}
@@ -145,11 +230,11 @@ def test_template_key_to_intent_response_key():
     [
         [
             "data/examples/rasa/demo-rasa.json",
-            "data/examples/rasa/demo-rasa-responses.md",
+            "data/examples/rasa/demo-rasa-responses.yml",
         ],
         [
-            "data/examples/rasa/demo-rasa.md",
-            "data/examples/rasa/demo-rasa-responses.md",
+            "data/examples/rasa/demo-rasa.yml",
+            "data/examples/rasa/demo-rasa-responses.yml",
         ],
     ],
 )
@@ -194,11 +279,11 @@ def test_demo_data(files: List[Text]):
     [
         [
             "data/examples/rasa/demo-rasa.json",
-            "data/examples/rasa/demo-rasa-responses.md",
+            "data/examples/rasa/demo-rasa-responses.yml",
         ],
         [
-            "data/examples/rasa/demo-rasa.md",
-            "data/examples/rasa/demo-rasa-responses.md",
+            "data/examples/rasa/demo-rasa.yml",
+            "data/examples/rasa/demo-rasa-responses.yml",
         ],
     ],
 )
@@ -224,7 +309,12 @@ def test_demo_data_filter_out_retrieval_intents(files):
 
 @pytest.mark.parametrize(
     "filepaths",
-    [["data/examples/rasa/demo-rasa.md", "data/examples/rasa/demo-rasa-responses.md"]],
+    [
+        [
+            "data/examples/rasa/demo-rasa.yml",
+            "data/examples/rasa/demo-rasa-responses.yml",
+        ]
+    ],
 )
 def test_train_test_split(filepaths: List[Text]):
     from rasa.shared.importers.utils import training_data_from_paths
@@ -289,9 +379,85 @@ def test_train_test_split(filepaths: List[Text]):
         )
 
 
+def test_number_of_examples_per_intent():
+    message_action = Message(data={"action_name": "utter_greet"})
+    message_intent = Message(
+        data={"text": "I would like the newsletter", "intent": "subscribe"}
+    )
+    message_non_nlu_intent = Message(data={"intent": "subscribe"})
+    message_other_intent_one = Message(
+        data={"text": "What is the weather like today?", "intent": "ask_weather"}
+    )
+    message_other_intent_two = Message(
+        data={"text": "Will it rain today?", "intent": "ask_weather"}
+    )
+    message_non_nlu_other_intent_three = Message(data={"intent": "ask_weather"})
+
+    training_examples = [
+        message_action,
+        message_intent,
+        message_non_nlu_intent,
+        message_other_intent_one,
+        message_other_intent_two,
+        message_non_nlu_other_intent_three,
+    ]
+    training_data = TrainingData(training_examples=training_examples)
+
+    assert training_data.number_of_examples_per_intent["subscribe"] == 1
+    assert training_data.number_of_examples_per_intent["ask_weather"] == 2
+
+
+def test_number_of_examples_per_intent_with_yaml(tmp_path: Path):
+    domain_path = tmp_path / "domain.yml"
+    domain_path.write_text(Domain.empty().as_yaml())
+
+    config_path = tmp_path / "config.yml"
+    config_path.touch()
+
+    importer = TrainingDataImporter.load_from_dict(
+        {},
+        str(config_path),
+        str(domain_path),
+        [
+            "data/test_number_nlu_examples/nlu.yml",
+            "data/test_number_nlu_examples/stories.yml",
+            "data/test_number_nlu_examples/rules.yml",
+        ],
+    )
+
+    training_data = importer.get_nlu_data()
+    assert training_data.intents == {"greet", "ask_weather"}
+    assert training_data.number_of_examples_per_intent["greet"] == 2
+    assert training_data.number_of_examples_per_intent["ask_weather"] == 3
+
+
+def test_validate_number_of_examples_per_intent():
+    message_intent = Message(
+        data={"text": "I would like the newsletter", "intent": "subscribe"}
+    )
+    message_non_nlu_intent = Message(data={"intent": "subscribe"})
+
+    training_examples = [message_intent, message_non_nlu_intent]
+    training_data = TrainingData(training_examples=training_examples)
+
+    with pytest.warns(Warning) as w:
+        training_data.validate()
+
+    assert len(w) == 1
+    assert (
+        w[0].message.args[0] == "Intent 'subscribe' has only 1 training examples! "
+        "Minimum is 2, training may fail."
+    )
+
+
 @pytest.mark.parametrize(
     "filepaths",
-    [["data/examples/rasa/demo-rasa.md", "data/examples/rasa/demo-rasa-responses.md"]],
+    [
+        [
+            "data/examples/rasa/demo-rasa.yml",
+            "data/examples/rasa/demo-rasa-responses.yml",
+        ]
+    ],
 )
 def test_train_test_split_with_random_seed(filepaths):
     from rasa.shared.importers.utils import training_data_from_paths
@@ -314,8 +480,7 @@ def test_train_test_split_with_random_seed(filepaths):
     "files",
     [
         ("data/examples/rasa/demo-rasa.json", "data/test/multiple_files_json"),
-        ("data/examples/rasa/demo-rasa.md", "data/test/multiple_files_markdown"),
-        ("data/examples/rasa/demo-rasa.md", "data/test/duplicate_intents_markdown"),
+        ("data/examples/rasa/demo-rasa.yml", "data/test/duplicate_intents_yaml"),
     ],
 )
 def test_data_merging(files):
@@ -330,15 +495,7 @@ def test_data_merging(files):
     assert td.regex_features == td_reference.regex_features
 
 
-def test_markdown_single_sections():
-    td_regex_only = load_data("data/test/markdown_single_sections/regex_only.md")
-    assert td_regex_only.regex_features == [{"name": "greet", "pattern": r"hey[^\s]*"}]
-
-    td_syn_only = load_data("data/test/markdown_single_sections/synonyms_only.md")
-    assert td_syn_only.entity_synonyms == {"Chines": "chinese", "Chinese": "chinese"}
-
-
-def test_repeated_entities(tmp_path):
+def test_repeated_entities(tmp_path: Path, whitespace_tokenizer: WhitespaceTokenizer):
     data = """
 {
   "rasa_nlu_data": {
@@ -365,7 +522,7 @@ def test_repeated_entities(tmp_path):
     example = td.entity_examples[0]
     entities = example.get("entities")
     assert len(entities) == 1
-    tokens = WhitespaceTokenizer().tokenize(example, attribute=TEXT)
+    tokens = whitespace_tokenizer.tokenize(example, attribute=TEXT)
     start, end = MitieEntityExtractor.find_entity(
         entities[0], example.get(TEXT), tokens
     )
@@ -373,7 +530,7 @@ def test_repeated_entities(tmp_path):
     assert end == 10
 
 
-def test_multiword_entities(tmp_path):
+def test_multiword_entities(tmp_path: Path, whitespace_tokenizer: WhitespaceTokenizer):
     data = """
 {
   "rasa_nlu_data": {
@@ -400,7 +557,7 @@ def test_multiword_entities(tmp_path):
     example = td.entity_examples[0]
     entities = example.get("entities")
     assert len(entities) == 1
-    tokens = WhitespaceTokenizer().tokenize(example, attribute=TEXT)
+    tokens = whitespace_tokenizer.tokenize(example, attribute=TEXT)
     start, end = MitieEntityExtractor.find_entity(
         entities[0], example.get(TEXT), tokens
     )
@@ -531,21 +688,9 @@ def cmp_dict_list(firsts, seconds):
             "es",
         ),
         (
-            "data/examples/rasa/demo-rasa.md",
+            "data/examples/rasa/demo-rasa.yml",
             "data/test/md_converted_to_json.json",
             "json",
-            None,
-        ),
-        (
-            "data/examples/rasa/demo-rasa.json",
-            "data/test/json_converted_to_md.md",
-            "md",
-            None,
-        ),
-        (
-            "data/test/training_data_containing_special_chars.json",
-            "data/test/json_with_special_chars_convered_to_md.md",
-            "md",
             None,
         ),
     ],
@@ -588,7 +733,7 @@ def test_training_data_conversion(
             rasa.shared.data.yaml_file_extension(),
         ),
         ("data/examples", rasa.shared.data.yaml_file_extension()),
-        ("data/examples/rasa/demo-rasa.md", rasa.shared.data.markdown_file_extension()),
+        ("data/examples/rasa/demo-rasa.yml", rasa.shared.data.yaml_file_extension()),
         ("data/rasa_yaml_examples", rasa.shared.data.yaml_file_extension()),
     ],
 )
@@ -632,7 +777,7 @@ def test_custom_attributes(tmp_path):
     assert example.get("sentiment") == 0.8
 
 
-async def test_without_additional_e2e_examples(tmp_path: Path):
+def test_without_additional_e2e_examples(tmp_path: Path):
     domain_path = tmp_path / "domain.yml"
     domain_path.write_text(Domain.empty().as_yaml())
 
@@ -655,27 +800,87 @@ async def test_without_additional_e2e_examples(tmp_path: Path):
     )
 
     # Patch to return our test stories
-    existing.get_stories = asyncio.coroutine(lambda *args: stories)
+    existing.get_stories = lambda *args: stories
 
     importer = E2EImporter(existing)
 
-    training_data = await importer.get_nlu_data()
+    training_data = importer.get_nlu_data()
 
     assert training_data.training_examples
     assert not training_data.is_empty()
     assert len(training_data.nlu_examples) == 0
 
 
+@pytest.mark.parametrize(
+    "source_lookup_table,expected_lookup_table",
+    [
+        (
+            {"name": "plates", "elements": "data/test/lookup_tables/plates.txt"},
+            {
+                "name": "plates",
+                "elements": "tacos\nbeef\nmapo tofu\nburrito\nlettuce wrap",
+            },
+        ),
+        (
+            {"name": "plates", "elements": ["data/test/lookup_tables/plates.txt"]},
+            {
+                "name": "plates",
+                "elements": "tacos\nbeef\nmapo tofu\nburrito\nlettuce wrap",
+            },
+        ),
+        (
+            {
+                "name": "plates",
+                "elements": "data/test/lookup_tables/not-existing-file.txt",
+            },
+            {
+                "name": "plates",
+                "elements": "data/test/lookup_tables/not-existing-file.txt",
+            },
+        ),
+        (
+            {"name": "test", "some_key": "some_value", "elements": "everything else"},
+            {"name": "test", "some_key": "some_value", "elements": "everything else"},
+        ),
+    ],
+)
+def test_load_lookup_table(
+    source_lookup_table: Dict[Text, Any], expected_lookup_table: Dict[Text, Any]
+):
+    assert TrainingData._load_lookup_table(source_lookup_table) == expected_lookup_table
+
+
 def test_fingerprint_is_same_when_loading_data_again():
     from rasa.shared.importers.utils import training_data_from_paths
 
     files = [
-        "data/examples/rasa/demo-rasa.md",
-        "data/examples/rasa/demo-rasa-responses.md",
+        "data/examples/rasa/demo-rasa.yml",
+        "data/examples/rasa/demo-rasa-responses.yml",
     ]
     td1 = training_data_from_paths(files, language="en")
     td2 = training_data_from_paths(files, language="en")
     assert td1.fingerprint() == td2.fingerprint()
+
+
+def test_fingerprint_is_different_when_lookup_table_has_changed(
+    monkeypatch: MonkeyPatch,
+):
+    from rasa.shared.importers.utils import training_data_from_paths
+
+    files = ["data/test/lookup_tables/lookup_table.json"]
+
+    td1 = training_data_from_paths(files, language="en")
+    fingerprint1 = td1.fingerprint()
+
+    monkeypatch.setattr(
+        TrainingData,
+        "_load_lookup_table",
+        Mock(return_value={"name": "plates", "elements": "tacos\nbeef"}),
+    )
+    td2 = training_data_from_paths(files, language="en")
+    fingerprint2 = td2.fingerprint()
+
+    assert fingerprint1 != fingerprint2
 
 
 @pytest.mark.parametrize(
@@ -698,3 +903,36 @@ def test_label_fingerprints(message: Message):
     )
     training_data2 = training_data1.merge(TrainingData([message]))
     assert training_data1.label_fingerprint() != training_data2.label_fingerprint()
+
+
+def test_training_data_fingerprint_incorporates_tokens(
+    whitespace_tokenizer: WhitespaceTokenizer,
+):
+    from rasa.shared.importers.utils import training_data_from_paths
+
+    files = [
+        "data/examples/rasa/demo-rasa.yml",
+        "data/examples/rasa/demo-rasa-responses.yml",
+    ]
+    training_data = training_data_from_paths(files, language="en")
+    fp1 = training_data.fingerprint()
+    whitespace_tokenizer.process_training_data(training_data)
+    # training data fingerprint has changed
+    assert fp1 != training_data.fingerprint()
+
+
+def test_training_data_fingerprint_incorporates_features():
+    from rasa.shared.importers.utils import training_data_from_paths
+
+    files = [
+        "data/examples/rasa/demo-rasa.yml",
+        "data/examples/rasa/demo-rasa-responses.yml",
+    ]
+    training_data = training_data_from_paths(files, language="en")
+    fp1 = training_data.fingerprint()
+    big_array = np.random.random((128, 128))
+
+    f1 = Features(big_array, FEATURE_TYPE_SENTENCE, TEXT, "RegexFeaturizer")
+    training_data.training_examples[0].add_features(f1)
+    # training data fingerprint has changed
+    assert fp1 != training_data.fingerprint()

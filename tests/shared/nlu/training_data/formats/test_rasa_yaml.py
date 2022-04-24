@@ -2,6 +2,7 @@ import textwrap
 from typing import Text
 
 import pytest
+import pathlib
 
 from rasa.shared.exceptions import YamlException, YamlSyntaxException
 import rasa.shared.utils.io
@@ -12,7 +13,6 @@ from rasa.shared.nlu.constants import (
     METADATA_INTENT,
     METADATA_EXAMPLE,
 )
-from rasa.shared.nlu.training_data.formats import NLGMarkdownReader
 from rasa.shared.nlu.training_data.formats.rasa_yaml import (
     RasaYAMLReader,
     RasaYAMLWriter,
@@ -30,7 +30,7 @@ nlu:
     - how much co2 is produced on a return flight from london to new york?
     - what's the co2 usage of a return flight to new york?
     - can you calculate the co2 footprint of a flight to london?
-"""
+"""  # noqa: E501
 
 MULTILINE_INTENT_EXAMPLE_WITH_SYNONYM = """
 nlu:
@@ -45,7 +45,7 @@ nlu:
   examples: |
     how much CO2 will that use?
     - how much carbon will a one way flight from [new york]{"entity": "city", "role": "from"} to california produce?
-"""
+"""  # noqa: E501
 
 INTENT_EXAMPLES_WITH_METADATA = f"""version: "{LATEST_TRAINING_DATA_FORMAT_VERSION}"
 nlu:
@@ -75,7 +75,7 @@ nlu:
   - text: |
       goodbye
     metadata: positive-sentiment
-"""
+"""  # noqa: E501
 
 
 MINIMAL_VALID_EXAMPLE = """
@@ -358,9 +358,9 @@ def test_minimal_valid_example():
     assert not len(record)
 
 
-def test_minimal_yaml_nlu_file(tmp_path):
+def test_minimal_yaml_nlu_file(tmp_path: pathlib.Path):
     target_file = tmp_path / "test_nlu_file.yaml"
-    rasa.shared.utils.io.write_yaml(MINIMAL_VALID_EXAMPLE, target_file, True)
+    rasa.shared.utils.io.write_text_file(MINIMAL_VALID_EXAMPLE, target_file)
     assert RasaYAMLReader.is_yaml_nlu_file(target_file)
 
 
@@ -470,27 +470,6 @@ def test_read_mixed_training_data_file():
         assert not len(record)
 
 
-def test_responses_are_converted_from_markdown():
-    responses_md = textwrap.dedent(
-        """
-      ## ask name
-      * chitchat/ask_name
-        - my name is Sara, Rasa's documentation bot!
-    """
-    )
-
-    result = NLGMarkdownReader().reads(responses_md)
-    dumped = RasaYAMLWriter().dumps(result)
-
-    validation_reader = RasaYAMLReader()
-    dumped_result = validation_reader.reads(dumped)
-
-    assert dumped_result.responses == result.responses
-
-    # dumping again should also not change the format
-    assert dumped == RasaYAMLWriter().dumps(dumped_result)
-
-
 def test_responses_text_multiline_is_preserved():
     responses_yml = textwrap.dedent(
         """
@@ -519,3 +498,19 @@ def test_responses_text_multiline_is_preserved():
 
     # dumping again should also not change the format
     assert dumped == RasaYAMLWriter().dumps(dumped_result)
+
+
+def test_intent_examples_multiline_consistency(tmp_path: pathlib.Path):
+    """Test that multiline examples are written back as multiline examples."""
+
+    training_data_file = (
+        pathlib.Path("data") / "test_multiline_intent_examples_yaml" / "nlu.yml"
+    )
+    training_data_from_disc = RasaYAMLReader().read(filename=training_data_file)
+
+    tmp_file = tmp_path / "nlu.yml"
+    RasaYAMLWriter().dump(tmp_file, training_data_from_disc)
+    rewritten_file_content = tmp_file.read_text(encoding="utf-8")
+    original_file_content = training_data_file.read_text(encoding="utf-8")
+
+    assert original_file_content == rewritten_file_content

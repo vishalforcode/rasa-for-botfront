@@ -1,15 +1,15 @@
 import asyncio
+import filecmp
 import logging
 import os
 import pickle
-import tarfile
 import tempfile
 import warnings
-import zipfile
+import re
 from asyncio import AbstractEventLoop
-from io import BytesIO as IOReader
 from pathlib import Path
-from typing import Text, Any, Union, List, Type, Callable, TYPE_CHECKING
+from typing import Text, Any, Union, List, Type, Callable, TYPE_CHECKING, Pattern
+from typing_extensions import Protocol
 
 import rasa.shared.constants
 import rasa.shared.utils.io
@@ -18,7 +18,24 @@ if TYPE_CHECKING:
     from prompt_toolkit.validation import Validator
 
 
+class WriteRow(Protocol):
+    """Describes a csv writer supporting a `writerow` method (workaround for typing)."""
+
+    def writerow(self, row: List[Text]) -> None:
+        """Write the given row.
+
+        Args:
+            row: the entries of a row as a list of strings
+        """
+        ...
+
+
 def configure_colored_logging(loglevel: Text) -> None:
+    """Configures coloredlogs library for specified loglevel.
+
+    Args:
+        loglevel: The loglevel to configure the library for
+    """
     import coloredlogs
 
     loglevel = loglevel or os.environ.get(
@@ -41,6 +58,13 @@ def configure_colored_logging(loglevel: Text) -> None:
 def enable_async_loop_debugging(
     event_loop: AbstractEventLoop, slow_callback_duration: float = 0.1
 ) -> AbstractEventLoop:
+    """Enables debugging on an event loop.
+
+    Args:
+        event_loop: The event loop to enable debugging on
+        slow_callback_duration: The threshold at which a callback should be
+                                alerted as slow.
+    """
     logging.info(
         "Enabling coroutine debugging. Loop id {}.".format(id(asyncio.get_event_loop()))
     )
@@ -80,28 +104,8 @@ def pickle_load(filename: Union[Text, Path]) -> Any:
         return pickle.load(f)
 
 
-def unarchive(byte_array: bytes, directory: Text) -> Text:
-    """Tries to unpack a byte array interpreting it as an archive.
-
-    Tries to use tar first to unpack, if that fails, zip will be used."""
-
-    try:
-        tar = tarfile.open(fileobj=IOReader(byte_array))
-        tar.extractall(directory)
-        tar.close()
-        return directory
-    except tarfile.TarError:
-        zip_ref = zipfile.ZipFile(IOReader(byte_array))
-        zip_ref.extractall(directory)
-        zip_ref.close()
-        return directory
-
-
 def create_temporary_file(data: Any, suffix: Text = "", mode: Text = "w+") -> Text:
-    """Creates a tempfile.NamedTemporaryFile object for data.
-
-    mode defines NamedTemporaryFile's  mode parameter in py3."""
-
+    """Creates a tempfile.NamedTemporaryFile object for data."""
     encoding = None if "b" in mode else rasa.shared.utils.io.DEFAULT_ENCODING
     f = tempfile.NamedTemporaryFile(
         mode=mode, suffix=suffix, delete=False, encoding=encoding
@@ -171,22 +175,15 @@ def create_validator(
     return FunctionValidator
 
 
-def zip_folder(folder: Text) -> Text:
-    """Create an archive from a folder."""
-    import shutil
-
-    zipped_path = tempfile.NamedTemporaryFile(delete=False)
-    zipped_path.close()
-
-    # WARN: not thread-safe!
-    return shutil.make_archive(zipped_path.name, "zip", folder)
-
-
-def json_unpickle(file_name: Union[Text, Path]) -> Any:
+def json_unpickle(
+    file_name: Union[Text, Path], encode_non_string_keys: bool = False
+) -> Any:
     """Unpickle an object from file using json.
 
     Args:
         file_name: the file to load the object from
+        encode_non_string_keys: If set to `True` then jsonpickle will encode non-string
+          dictionary keys instead of coercing them into strings via `repr()`.
 
     Returns: the object
     """
@@ -196,19 +193,77 @@ def json_unpickle(file_name: Union[Text, Path]) -> Any:
     jsonpickle_numpy.register_handlers()
 
     file_content = rasa.shared.utils.io.read_file(file_name)
-    return jsonpickle.loads(file_content)
+    return jsonpickle.loads(file_content, keys=encode_non_string_keys)
 
 
-def json_pickle(file_name: Union[Text, Path], obj: Any) -> None:
+def json_pickle(
+    file_name: Union[Text, Path], obj: Any, encode_non_string_keys: bool = False
+) -> None:
     """Pickle an object to a file using json.
 
     Args:
         file_name: the file to store the object to
         obj: the object to store
+        encode_non_string_keys: If set to `True` then jsonpickle will encode non-string
+          dictionary keys instead of coercing them into strings via `repr()`.
     """
     import jsonpickle.ext.numpy as jsonpickle_numpy
     import jsonpickle
 
     jsonpickle_numpy.register_handlers()
 
-    rasa.shared.utils.io.write_text_file(jsonpickle.dumps(obj), file_name)
+    rasa.shared.utils.io.write_text_file(
+        jsonpickle.dumps(obj, keys=encode_non_string_keys), file_name
+    )
+
+
+def get_emoji_regex() -> Pattern:
+    """Returns regex to identify emojis."""
+    return re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\u200d"  # zero width joiner
+        "\u200c"  # zero width non-joiner
+        "]+",
+        flags=re.UNICODE,
+    )
+
+
+def are_directories_equal(dir1: Path, dir2: Path) -> bool:
+    """Compares two directories recursively.
+
+    Files in each directory are
+    assumed to be equal if their names and contents are equal.
+
+    Args:
+        dir1: The first directory.
+        dir2: The second directory.
+
+    Returns:
+        `True` if they are equal, `False` otherwise.
+    """
+    dirs_cmp = filecmp.dircmp(dir1, dir2)
+    if dirs_cmp.left_only or dirs_cmp.right_only:
+        return False
+
+    (_, mismatches, errors) = filecmp.cmpfiles(
+        dir1, dir2, dirs_cmp.common_files, shallow=False
+    )
+
+    if mismatches or errors:
+        return False
+
+    for common_dir in dirs_cmp.common_dirs:
+        new_dir1 = Path(dir1, common_dir)
+        new_dir2 = Path(dir2, common_dir)
+
+        is_equal = are_directories_equal(new_dir1, new_dir2)
+        if not is_equal:
+            return False
+
+    return True

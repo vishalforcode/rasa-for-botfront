@@ -6,10 +6,10 @@ import os
 import tempfile
 import traceback
 from collections import defaultdict
-from functools import reduce, wraps, partial
-from http import HTTPStatus
+from functools import reduce, wraps
 from inspect import isawaitable
 from pathlib import Path
+from http import HTTPStatus
 from typing import (
     Any,
     Callable,
@@ -24,6 +24,7 @@ from typing import (
 )
 
 import aiohttp
+import jsonschema
 from sanic import Sanic, response
 from sanic.request import Request
 from sanic.response import HTTPResponse
@@ -32,29 +33,28 @@ from sanic_jwt import Initialize, exceptions
 
 import rasa
 import rasa.core.utils
+from rasa.nlu.emulators.emulator import Emulator
 import rasa.utils.common
 import rasa.shared.utils.common
 import rasa.shared.utils.io
 import rasa.utils.endpoints
 import rasa.utils.io
-import rasa.shared.data
 from rasa.shared.core.training_data.story_writer.yaml_story_writer import (
     YAMLStoryWriter,
 )
 from rasa.shared.importers.importer import TrainingDataImporter
 from rasa.shared.nlu.training_data.formats import RasaYAMLReader
-from rasa import model
-from rasa.constants import DEFAULT_RESPONSE_TIMEOUT, MINIMUM_COMPATIBLE_VERSION
+from rasa.core.constants import DEFAULT_RESPONSE_TIMEOUT
+from rasa.constants import MINIMUM_COMPATIBLE_VERSION
 from rasa.shared.constants import (
     DOCS_URL_TRAINING_DATA,
     DOCS_BASE_URL,
     DEFAULT_SENDER_ID,
-    DEFAULT_DOMAIN_PATH,
     DEFAULT_MODELS_PATH,
+    TEST_STORIES_FILE_PREFIX,
 )
 from rasa.shared.core.domain import InvalidDomain, Domain
 from rasa.core.agent import Agent
-from rasa.core.brokers.broker import EventBroker
 from rasa.core.channels.channel import (
     CollectingOutputChannel,
     OutputChannel,
@@ -62,18 +62,28 @@ from rasa.core.channels.channel import (
 )
 import rasa.shared.core.events
 from rasa.shared.core.events import Event
-from rasa.core.lock_store import LockStore
 from rasa.core.test import test
-from rasa.core.tracker_store import TrackerStore
 from rasa.shared.core.trackers import DialogueStateTracker, EventVerbosity
 from rasa.core.utils import AvailableEndpoints
 from rasa.nlu.emulators.no_emulator import NoEmulator
-from rasa.nlu.test import run_evaluation, CVEvaluationResult
+import rasa.nlu.test
+from rasa.nlu.test import CVEvaluationResult
+from rasa.shared.utils.schemas.events import EVENTS_SCHEMA
 from rasa.utils.endpoints import EndpointConfig
 
 if TYPE_CHECKING:
-    from ssl import SSLContext
+    from ssl import SSLContext  # noqa: F401
     from rasa.core.processor import MessageProcessor
+    from mypy_extensions import Arg, VarArg, KwArg
+
+    SanicResponse = Union[
+        response.HTTPResponse, Coroutine[Any, Any, response.HTTPResponse]
+    ]
+    SanicView = Callable[
+        [Arg(Request, "request"), VarArg(), KwArg()],  # noqa: F821
+        SanicResponse,
+    ]
+
 
 logger = logging.getLogger(__name__)
 
@@ -124,22 +134,20 @@ def _docs(sub_url: Text) -> Text:
     return DOCS_BASE_URL + sub_url
 
 
-def ensure_loaded_agent(app: Sanic, require_core_is_ready=False):
+def ensure_loaded_agent(
+    app: Sanic, require_core_is_ready: bool = False
+) -> Callable[[Callable], Callable[..., Any]]:
     """Wraps a request handler ensuring there is a loaded and usable agent.
 
     Require the agent to have a loaded Core model if `require_core_is_ready` is
     `True`.
     """
 
-    def decorator(f):
+    def decorator(f: Callable) -> Callable:
         @wraps(f)
-        def decorated(*args, **kwargs):
+        def decorated(*args: Any, **kwargs: Any) -> Any:
             # noinspection PyUnresolvedReferences
-            if not app.agent or not (
-                app.agent.is_core_ready()
-                if require_core_is_ready
-                else app.agent.is_ready()
-            ):
+            if not app.ctx.agent or not app.ctx.agent.is_ready():
                 raise ErrorResponse(
                     HTTPStatus.CONFLICT,
                     "Conflict",
@@ -155,10 +163,31 @@ def ensure_loaded_agent(app: Sanic, require_core_is_ready=False):
     return decorator
 
 
-def requires_auth(app: Sanic, token: Optional[Text] = None) -> Callable[[Any], Any]:
+def ensure_conversation_exists() -> Callable[["SanicView"], "SanicView"]:
+    """Wraps a request handler ensuring the conversation exists."""
+
+    def decorator(f: "SanicView") -> "SanicView":
+        @wraps(f)
+        def decorated(request: Request, *args: Any, **kwargs: Any) -> "SanicResponse":
+            conversation_id = kwargs["conversation_id"]
+            if request.app.ctx.agent.tracker_store.exists(conversation_id):
+                return f(request, *args, **kwargs)
+            else:
+                raise ErrorResponse(
+                    HTTPStatus.NOT_FOUND, "Not found", "Conversation ID not found."
+                )
+
+        return decorated
+
+    return decorator
+
+
+def requires_auth(
+    app: Sanic, token: Optional[Text] = None
+) -> Callable[["SanicView"], "SanicView"]:
     """Wraps a request handler with token authentication."""
 
-    def decorator(f: Callable[[Any, Any], Any]) -> Callable[[Any, Any], Any]:
+    def decorator(f: "SanicView") -> "SanicView":
         def conversation_id_from_args(args: Any, kwargs: Any) -> Optional[Text]:
             argnames = rasa.shared.utils.common.arguments_of(f)
 
@@ -173,11 +202,11 @@ def requires_auth(app: Sanic, token: Optional[Text] = None) -> Callable[[Any], A
                 return None
 
         async def sufficient_scope(
-            request, *args: Any, **kwargs: Any
+            request: Request, *args: Any, **kwargs: Any
         ) -> Optional[bool]:
             # This is a coroutine since `sanic-jwt==1.6`
             jwt_data = await rasa.utils.common.call_potential_coroutine(
-                request.app.auth.extract_payload(request)
+                request.app.ctx.auth.extract_payload(request)
             )
 
             user = jwt_data.get("user", {})
@@ -194,27 +223,25 @@ def requires_auth(app: Sanic, token: Optional[Text] = None) -> Callable[[Any], A
                 return False
 
         @wraps(f)
-        async def decorated(request: Request, *args: Any, **kwargs: Any) -> Any:
+        async def decorated(
+            request: Request, *args: Any, **kwargs: Any
+        ) -> response.HTTPResponse:
 
             provided = request.args.get("token", None)
 
             # noinspection PyProtectedMember
             if token is not None and provided == token:
                 result = f(request, *args, **kwargs)
-                if isawaitable(result):
-                    result = await result
-                return result
+                return await result if isawaitable(result) else result
             elif app.config.get(
                 "USE_JWT"
             ) and await rasa.utils.common.call_potential_coroutine(
                 # This is a coroutine since `sanic-jwt==1.6`
-                request.app.auth.is_authenticated(request)
+                request.app.ctx.auth.is_authenticated(request)
             ):
                 if await sufficient_scope(request, *args, **kwargs):
                     result = f(request, *args, **kwargs)
-                    if isawaitable(result):
-                        result = await result
-                    return result
+                    return await result if isawaitable(result) else result
                 raise ErrorResponse(
                     HTTPStatus.FORBIDDEN,
                     "NotAuthorized",
@@ -226,9 +253,7 @@ def requires_auth(app: Sanic, token: Optional[Text] = None) -> Callable[[Any], A
             elif token is None and app.config.get("USE_JWT") is None:
                 # authentication is disabled
                 result = f(request, *args, **kwargs)
-                if isawaitable(result):
-                    result = await result
-                return result
+                return await result if isawaitable(result) else result
             raise ErrorResponse(
                 HTTPStatus.UNAUTHORIZED,
                 "NotAuthenticated",
@@ -346,6 +371,25 @@ def validate_request_body(request: Request, error_message: Text) -> None:
         raise ErrorResponse(HTTPStatus.BAD_REQUEST, "BadRequest", error_message)
 
 
+def validate_events_in_request_body(request: Request) -> None:
+    """Validates events format in request body."""
+    if not isinstance(request.json, list):
+        events = [request.json]
+    else:
+        events = request.json
+
+    try:
+        jsonschema.validate(events, EVENTS_SCHEMA)
+    except jsonschema.ValidationError as error:
+        raise ErrorResponse(
+            HTTPStatus.BAD_REQUEST,
+            "BadRequest",
+            f"Failed to validate the events format. "
+            f"For more information about the format visit the docs. Error: {error}",
+            help_url=_docs("/pages/http-api"),
+        ) from error
+
+
 async def authenticate(_: Request) -> NoReturn:
     """Callback for authentication failed."""
     raise exceptions.AuthenticationFailed(
@@ -388,10 +432,11 @@ def create_ssl_context(
         return None
 
 
-def _create_emulator(mode: Optional[Text]) -> NoEmulator:
+def _create_emulator(mode: Optional[Text]) -> Emulator:
     """Create emulator for specified mode.
-    If no emulator is specified, we will use the Rasa NLU format."""
 
+    If no emulator is specified, we will use the Rasa NLU format.
+    """
     if mode is None:
         return NoEmulator()
     elif mode.lower() == "wit":
@@ -421,31 +466,13 @@ async def _load_agent(
     model_server: Optional[EndpointConfig] = None,
     remote_storage: Optional[Text] = None,
     endpoints: Optional[AvailableEndpoints] = None,
-    lock_store: Optional[LockStore] = None,
 ) -> Agent:
     try:
-        tracker_store = None
-        generator = None
-        action_endpoint = None
-
-        if endpoints:
-            broker = await EventBroker.create(endpoints.event_broker)
-            tracker_store = TrackerStore.create(
-                endpoints.tracker_store, event_broker=broker
-            )
-            generator = endpoints.nlg
-            action_endpoint = endpoints.action
-            if not lock_store:
-                lock_store = LockStore.create(endpoints.lock_store)
-
         loaded_agent = await rasa.core.agent.load_agent(
-            model_path,
-            model_server,
-            remote_storage,
-            generator=generator,
-            tracker_store=tracker_store,
-            lock_store=lock_store,
-            action_endpoint=action_endpoint,
+            model_path=model_path,
+            model_server=model_server,
+            remote_storage=remote_storage,
+            endpoints=endpoints,
         )
     except Exception as e:
         logger.debug(traceback.format_exc())
@@ -455,7 +482,7 @@ async def _load_agent(
             f"An unexpected error occurred. Error: {e}",
         )
 
-    if not loaded_agent:
+    if not loaded_agent.is_ready():
         raise ErrorResponse(
             HTTPStatus.BAD_REQUEST,
             "BadRequest",
@@ -482,13 +509,13 @@ def configure_cors(
     )
 
 
-def add_root_route(app: Sanic):
+def add_root_route(app: Sanic) -> None:
     """Add '/' route to return hello."""
 
     @app.get("/")
-    async def hello(request: Request):
+    async def hello(request: Request) -> HTTPResponse:
         """Check if the server is running and responds with the version."""
-        return response.text("Hello from Rasa: " + rasa.__version_bf__)  # bf
+        return response.text("Hello from Rasa: " + rasa.__version__)
 
 
 def async_if_callback_url(f: Callable[..., Coroutine]) -> Callable:
@@ -519,7 +546,7 @@ def async_if_callback_url(f: Callable[..., Coroutine]) -> Callable:
         async def wrapped() -> None:
             try:
                 result: HTTPResponse = await f(request, *args, **kwargs)
-                payload = dict(
+                payload: Dict[Text, Any] = dict(
                     data=result.body, headers={"Content-Type": result.content_type}
                 )
                 logger.debug(
@@ -575,14 +602,7 @@ def run_in_thread(f: Callable[..., Coroutine]) -> Callable:
         # Use a sync wrapper for our `async` function as `run_in_executor` only supports
         # sync functions
         def run() -> HTTPResponse:
-            # This is a new thread, so we need to create and set a new event loop
-            thread_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(thread_loop)
-
-            try:
-                return thread_loop.run_until_complete(f(request, *args, **kwargs))
-            finally:
-                thread_loop.close()
+            return asyncio.run(f(request, *args, **kwargs))
 
         with concurrent.futures.ThreadPoolExecutor() as pool:
             return await request.app.loop.run_in_executor(pool, run)
@@ -617,15 +637,23 @@ def create_app(
     jwt_secret: Optional[Text] = None,
     jwt_method: Text = "HS256",
     endpoints: Optional[AvailableEndpoints] = None,
-):
+) -> Sanic:
     """Class representing a Rasa HTTP server."""
-
-    app = Sanic(__name__)
+    app = Sanic("rasa_server")
     app.config.RESPONSE_TIMEOUT = response_timeout
     configure_cors(app, cors_origins)
 
     # Setup the Sanic-JWT extension
     if jwt_secret and jwt_method:
+        # `sanic-jwt` depends on having an available event loop when making the call to
+        # `Initialize`. If there is none, the server startup will fail with
+        # `There is no current event loop in thread 'MainThread'`.
+        try:
+            _ = asyncio.get_running_loop()
+        except RuntimeError:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+
         # since we only want to check signatures, we don't actually care
         # about the JWT method and set the passed secret as either symmetric
         # or asymmetric key. jwt lib will choose the right one based on method
@@ -638,24 +666,26 @@ def create_app(
             user_id="username",
         )
 
-    app.agent = agent
+    app.ctx.agent = agent
     # Initialize shared object of type unsigned int for tracking
     # the number of active training processes
-    app.active_training_processes = multiprocessing.Value("I", 0)
+    app.ctx.active_training_processes = multiprocessing.Value("I", 0)
 
     @app.exception(ErrorResponse)
-    async def handle_error_response(request: Request, exception: ErrorResponse):
+    async def handle_error_response(
+        request: Request, exception: ErrorResponse
+    ) -> HTTPResponse:
         return response.json(exception.error_info, status=exception.status)
 
     add_root_route(app)
 
     @app.get("/version")
-    async def version(request: Request):
+    async def version(request: Request) -> HTTPResponse:
         """Respond with the version number of the installed Rasa."""
 
         return response.json(
             {
-                "version": rasa.__version_bf__,  # bf
+                "version": rasa.__version__,
                 "minimum_compatible_version": MINIMUM_COMPATIBLE_VERSION,
             }
         )
@@ -663,28 +693,25 @@ def create_app(
     @app.get("/status")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def status(request: Request):
+    async def status(request: Request) -> HTTPResponse:
         """Respond with the model name and the fingerprint of that model."""
-
         return response.json(
             {
-                "model_file": app.agent.path_to_model_archive
-                or app.agent.model_directory,
-                "fingerprint": model.fingerprint_from_path(app.agent.model_directory),
-                "num_active_training_jobs": app.active_training_processes.value,
+                "model_file": app.ctx.agent.processor.model_filename,
+                "model_id": app.ctx.agent.model_id,
+                "num_active_training_jobs": app.ctx.active_training_processes.value,
             }
         )
 
     @app.get("/conversations/<conversation_id:path>/tracker")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def retrieve_tracker(request: Request, conversation_id: Text):
+    async def retrieve_tracker(request: Request, conversation_id: Text) -> HTTPResponse:
         """Get a dump of a conversation's tracker including its events."""
-
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
         until_time = rasa.utils.endpoints.float_arg(request, "until")
 
-        tracker = await app.agent.create_processor().fetch_tracker_with_initial_session(
+        tracker = await app.ctx.agent.processor.fetch_tracker_with_initial_session(
             conversation_id
         )
 
@@ -705,23 +732,19 @@ def create_app(
     @app.post("/conversations/<conversation_id:path>/tracker/events")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def append_events(request: Request, conversation_id: Text):
-        """Append a list of events to the state of a conversation"""
-        validate_request_body(
-            request,
-            "You must provide events in the request body in order to append them"
-            "to the state of a conversation.",
-        )
+    async def append_events(request: Request, conversation_id: Text) -> HTTPResponse:
+        """Append a list of events to the state of a conversation."""
+        validate_events_in_request_body(request)
 
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
 
         try:
-            async with app.agent.lock_store.lock(conversation_id):
-                processor = app.agent.create_processor()
+            async with app.ctx.agent.lock_store.lock(conversation_id):
+                processor = app.ctx.agent.processor
                 events = _get_events_from_request_body(request)
 
                 tracker = await update_conversation_with_events(
-                    conversation_id, processor, app.agent.domain, events
+                    conversation_id, processor, app.ctx.agent.domain, events
                 )
 
                 output_channel = _get_output_channel(request, tracker)
@@ -733,7 +756,7 @@ def create_app(
                         events, tracker, output_channel
                     )
 
-                app.agent.tracker_store.save(tracker)
+                app.ctx.agent.tracker_store.save(tracker)
 
             return response.json(tracker.current_state(verbosity))
         except Exception as e:
@@ -770,24 +793,20 @@ def create_app(
     @app.put("/conversations/<conversation_id:path>/tracker/events")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def replace_events(request: Request, conversation_id: Text):
+    async def replace_events(request: Request, conversation_id: Text) -> HTTPResponse:
         """Use a list of events to set a conversations tracker to a state."""
-        validate_request_body(
-            request,
-            "You must provide events in the request body to set the sate of the "
-            "conversation tracker.",
-        )
+        validate_events_in_request_body(request)
 
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
 
         try:
-            async with app.agent.lock_store.lock(conversation_id):
+            async with app.ctx.agent.lock_store.lock(conversation_id):
                 tracker = DialogueStateTracker.from_dict(
-                    conversation_id, request.json, app.agent.domain.slots
+                    conversation_id, request.json, app.ctx.agent.domain.slots
                 )
 
                 # will override an existing tracker with the same id!
-                app.agent.tracker_store.save(tracker)
+                app.ctx.agent.tracker_store.save(tracker)
 
             return response.json(tracker.current_state(verbosity))
         except Exception as e:
@@ -801,7 +820,8 @@ def create_app(
     @app.get("/conversations/<conversation_id:path>/story")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def retrieve_story(request: Request, conversation_id: Text):
+    @ensure_conversation_exists()
+    async def retrieve_story(request: Request, conversation_id: Text) -> HTTPResponse:
         """Get an end-to-end story corresponding to this conversation."""
         until_time = rasa.utils.endpoints.float_arg(request, "until")
         fetch_all_sessions = rasa.utils.endpoints.bool_arg(
@@ -810,7 +830,7 @@ def create_app(
 
         try:
             stories = get_test_stories(
-                app.agent.create_processor(),
+                app.ctx.agent.processor,
                 conversation_id,
                 until_time,
                 fetch_all_sessions=fetch_all_sessions,
@@ -827,7 +847,14 @@ def create_app(
     @app.post("/conversations/<conversation_id:path>/execute")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def execute_action(request: Request, conversation_id: Text):
+    @ensure_conversation_exists()
+    async def execute_action(request: Request, conversation_id: Text) -> HTTPResponse:
+        rasa.shared.utils.io.raise_warning(
+            'The "POST /conversations/<conversation_id>/execute"'
+            " endpoint is deprecated. Inserting actions to the tracker externally"
+            " should be avoided. Actions should be predicted by the policies only.",
+            category=FutureWarning,
+        )
         request_params = request.json
 
         action_to_execute = request_params.get("name", None)
@@ -845,13 +872,15 @@ def create_app(
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
 
         try:
-            async with app.agent.lock_store.lock(conversation_id):
-                tracker = await app.agent.create_processor().fetch_tracker_and_update_session(
-                    conversation_id
+            async with app.ctx.agent.lock_store.lock(conversation_id):
+                tracker = await (
+                    app.ctx.agent.processor.fetch_tracker_and_update_session(
+                        conversation_id
+                    )
                 )
 
                 output_channel = _get_output_channel(request, tracker)
-                await app.agent.execute_action(
+                await app.ctx.agent.execute_action(
                     conversation_id,
                     action_to_execute,
                     output_channel,
@@ -869,7 +898,7 @@ def create_app(
 
         state = tracker.current_state(verbosity)
 
-        response_body = {"tracker": state}
+        response_body: Dict[Text, Any] = {"tracker": state}
 
         if isinstance(output_channel, CollectingOutputChannel):
             response_body["messages"] = output_channel.messages
@@ -896,18 +925,20 @@ def create_app(
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
 
         try:
-            async with app.agent.lock_store.lock(conversation_id):
-                tracker = await app.agent.create_processor().fetch_tracker_and_update_session(
-                    conversation_id
+            async with app.ctx.agent.lock_store.lock(conversation_id):
+                tracker = await (
+                    app.ctx.agent.processor.fetch_tracker_and_update_session(
+                        conversation_id
+                    )
                 )
                 output_channel = _get_output_channel(request, tracker)
-                if intent_to_trigger not in app.agent.domain.intents:
+                if intent_to_trigger not in app.ctx.agent.domain.intents:
                     raise ErrorResponse(
                         HTTPStatus.NOT_FOUND,
                         "NotFound",
                         f"The intent {trigger_intent} does not exist in the domain.",
                     )
-                await app.agent.trigger_intent(
+                await app.ctx.agent.trigger_intent(
                     intent_name=intent_to_trigger,
                     entities=entities,
                     output_channel=output_channel,
@@ -925,7 +956,7 @@ def create_app(
 
         state = tracker.current_state(verbosity)
 
-        response_body = {"tracker": state}
+        response_body: Dict[Text, Any] = {"tracker": state}
 
         if isinstance(output_channel, CollectingOutputChannel):
             response_body["messages"] = output_channel.messages
@@ -935,10 +966,11 @@ def create_app(
     @app.post("/conversations/<conversation_id:path>/predict")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
+    @ensure_conversation_exists()
     async def predict(request: Request, conversation_id: Text) -> HTTPResponse:
         try:
             # Fetches the appropriate bot response in a json format
-            responses = await app.agent.predict_next(conversation_id)
+            responses = await app.ctx.agent.predict_next_for_sender_id(conversation_id)
             responses["scores"] = sorted(
                 responses["scores"], key=lambda k: (-k["score"], k["action"])
             )
@@ -954,7 +986,7 @@ def create_app(
     @app.post("/conversations/<conversation_id:path>/messages")
     @requires_auth(app, auth_token)
     @ensure_loaded_agent(app)
-    async def add_message(request: Request, conversation_id: Text):
+    async def add_message(request: Request, conversation_id: Text) -> HTTPResponse:
         validate_request_body(
             request,
             "No message defined in request body. Add a message to the request body in "
@@ -982,8 +1014,15 @@ def create_app(
         user_message = UserMessage(message, None, conversation_id, parse_data)
 
         try:
-            async with app.agent.lock_store.lock(conversation_id):
-                tracker = await app.agent.log_message(user_message)
+            async with app.ctx.agent.lock_store.lock(conversation_id):
+                # cf. processor.handle_message (ignoring prediction loop run)
+                tracker = await app.ctx.agent.processor.log_message(
+                    user_message, should_save_tracker=False
+                )
+                tracker = await app.ctx.agent.processor.run_action_extract_slots(
+                    user_message.output_channel, tracker
+                )
+                app.ctx.agent.processor.save_tracker(tracker)
 
             return response.json(tracker.current_state(verbosity))
         except Exception as e:
@@ -1006,33 +1045,19 @@ def create_app(
             "train your model.",
         )
 
-        load_model_after = request.args.get("load_model_after", False)
-        if request.headers.get("Content-type") == YAML_CONTENT_TYPE:
-            training_payload = _training_payload_from_yaml(request, temporary_directory)
-        else:
-            training_payload = _training_payload_from_json(request, temporary_directory)
-            load_model_after = request.json.get("load_model_after", load_model_after)
+        training_payload = _training_payload_from_yaml(request, temporary_directory)
 
         try:
-            with app.active_training_processes.get_lock():
-                app.active_training_processes.value += 1
+            with app.ctx.active_training_processes.get_lock():
+                app.ctx.active_training_processes.value += 1
 
-            from rasa.train import train_async
+            from rasa.model_training import train
 
             # pass `None` to run in default executor
-            training_result = await train_async(**training_payload)
+            training_result = train(**training_payload)
 
             if training_result.model:
                 filename = os.path.basename(training_result.model)
-
-                if load_model_after is True:
-                    app.agent = await _load_agent(
-                        training_result.model,
-                        endpoints=endpoints,
-                        lock_store=app.agent.lock_store,
-                    )
-
-                    logger.debug(f"Successfully loaded model '{filename}'.")
 
                 return await response.file(
                     training_result.model,
@@ -1061,8 +1086,8 @@ def create_app(
                 f"An unexpected error occurred during training. Error: {e}",
             )
         finally:
-            with app.active_training_processes.get_lock():
-                app.active_training_processes.value -= 1
+            with app.ctx.active_training_processes.get_lock():
+                app.ctx.active_training_processes.value -= 1
 
     @app.post("/model/test/stories")
     @requires_auth(app, auth_token)
@@ -1080,11 +1105,11 @@ def create_app(
 
         test_data = _test_data_file_from_payload(request, temporary_directory)
 
-        use_e2e = rasa.utils.endpoints.bool_arg(request, "e2e", default=False)
+        e2e = rasa.utils.endpoints.bool_arg(request, "e2e", default=False)
 
         try:
             evaluation = await test(
-                test_data, app.agent, e2e=use_e2e, disable_plotting=True
+                test_data, app.ctx.agent, e2e=e2e, disable_plotting=True
             )
             return response.json(evaluation)
         except Exception as e:
@@ -1134,9 +1159,7 @@ def create_app(
 
         if not cross_validation_folds:
             test_coroutine = _evaluate_model_using_test_set(
-                request.args.get("model"),
-                test_data,
-                request.args.get("language"),  # bf
+                request.args.get("model"), test_data
             )
 
         try:
@@ -1151,14 +1174,14 @@ def create_app(
             )
 
     async def _evaluate_model_using_test_set(
-        model_path: Text, test_data_file: Text, language: Text,  # bf
+        model_path: Text, test_data_file: Text
     ) -> Dict:
         logger.info("Starting model evaluation using test set.")
 
-        eval_agent = app.agent
+        eval_agent = app.ctx.agent
 
         if model_path:
-            model_server = app.agent.model_server
+            model_server = app.ctx.agent.model_server
             if model_server is not None:
                 model_server = model_server.copy()
                 model_server.url = model_path
@@ -1166,54 +1189,31 @@ def create_app(
                 # a job to pull the model from the server
                 model_server.kwargs["wait_time_between_pulls"] = 0
             eval_agent = await _load_agent(
-                model_path, model_server, app.agent.remote_storage
+                model_path=model_path,
+                model_server=model_server,
+                remote_storage=app.ctx.agent.remote_storage,
             )
 
         data_path = os.path.abspath(test_data_file)
 
-        if not eval_agent.model_directory or not os.path.exists(
-            eval_agent.model_directory
-        ):
+        if not eval_agent.is_ready():
             raise ErrorResponse(
                 HTTPStatus.CONFLICT, "Conflict", "Loaded model file not found."
             )
 
-        model_directory = eval_agent.model_directory
-        _, nlu_model = model.get_model_subdirectories(model_directory)
-
-        # bf >
-        # return run_evaluation(
-        #     data_path, nlu_model, disable_plotting=True, report_as_dict=True
-        # )
-        evaluation = run_evaluation(
-            data_path,
-            nlu_model.get(language),
-            disable_plotting=True,
-            errors=True,
-            output_directory=model_directory,
+        return await rasa.nlu.test.run_evaluation(
+            data_path, eval_agent.processor, disable_plotting=True, report_as_dict=True
         )
-
-        for classifier in evaluation.get("entity_evaluation", {}):
-            entity_errors_file = os.path.join(
-                model_directory, f"{classifier}_errors.json"
-            )
-            if os.path.isfile(entity_errors_file):
-                entity_errors = rasa.shared.utils.io.read_json_file(entity_errors_file)
-                evaluation["entity_evaluation"][classifier][
-                    "predictions"
-                ] = entity_errors
-        return evaluation
-        # </ bf
 
     async def _cross_validate(data_file: Text, config_file: Text, folds: int) -> Dict:
         logger.info(f"Starting cross-validation with {folds} folds.")
         importer = TrainingDataImporter.load_from_dict(
             config=None, config_path=config_file, training_data_paths=[data_file]
         )
-        config = await importer.get_config()
-        nlu_data = await importer.get_nlu_data()
+        config = importer.get_config()
+        nlu_data = importer.get_nlu_data()
 
-        evaluations = rasa.nlu.cross_validate(
+        evaluations = await rasa.nlu.test.cross_validate(
             data=nlu_data,
             n_folds=folds,
             nlu_config=config,
@@ -1236,7 +1236,7 @@ def create_app(
             "response_selection_evaluation": response_selector_report,
         }
 
-        result = defaultdict(dict)
+        result: defaultdict[Text, Any] = defaultdict(dict)
         for evaluation_name, evaluation in eval_name_mapping.items():
             report = evaluation.evaluation.get("report", {})
             averages = report.get("weighted avg", {})
@@ -1252,17 +1252,13 @@ def create_app(
     @ensure_loaded_agent(app, require_core_is_ready=True)
     async def tracker_predict(request: Request) -> HTTPResponse:
         """Given a list of events, predicts the next action."""
-        validate_request_body(
-            request,
-            "No events defined in request_body. Add events to request body in order to "
-            "predict the next action.",
-        )
+        validate_events_in_request_body(request)
 
         verbosity = event_verbosity_parameter(request, EventVerbosity.AFTER_RESTART)
         request_params = request.json
         try:
             tracker = DialogueStateTracker.from_dict(
-                DEFAULT_SENDER_ID, request_params, app.agent.domain.slots
+                DEFAULT_SENDER_ID, request_params, app.ctx.agent.domain.slots
             )
         except Exception as e:
             logger.debug(traceback.format_exc())
@@ -1274,9 +1270,7 @@ def create_app(
             )
 
         try:
-            result = app.agent.create_processor().predict_next_with_tracker(
-                tracker, verbosity
-            )
+            result = app.ctx.agent.predict_next_with_tracker(tracker, verbosity)
 
             return response.json(result)
         except Exception as e:
@@ -1302,9 +1296,7 @@ def create_app(
         try:
             data = emulator.normalise_request_json(request.json)
             try:
-                parsed_data = await app.agent.parse_message_using_nlu_interpreter(
-                    data.get("text"), lang=request.json.get("lang"),  # bf
-                )
+                parsed_data = await app.ctx.agent.parse_message(data.get("text"))
             except Exception as e:
                 logger.debug(traceback.format_exc())
                 raise ErrorResponse(
@@ -1345,9 +1337,14 @@ def create_app(
                     {"parameter": "model_server", "in": "body"},
                 )
 
-        app.agent = await _load_agent(
-            model_path, model_server, remote_storage, endpoints, app.agent.lock_store
+        new_agent = await _load_agent(
+            model_path=model_path,
+            model_server=model_server,
+            remote_storage=remote_storage,
+            endpoints=endpoints,
         )
+        new_agent.lock_store = app.ctx.agent.lock_store
+        app.ctx.agent = new_agent
 
         logger.debug(f"Successfully loaded model '{model_path}'.")
         return response.json(None, status=HTTPStatus.NO_CONTENT)
@@ -1355,9 +1352,9 @@ def create_app(
     @app.delete("/model")
     @requires_auth(app, auth_token)
     async def unload_model(request: Request) -> HTTPResponse:
-        model_file = app.agent.model_directory
+        model_file = app.ctx.agent.model_name
 
-        app.agent = Agent(lock_store=app.agent.lock_store)
+        app.ctx.agent = Agent(lock_store=app.ctx.agent.lock_store)
 
         logger.debug(f"Successfully unloaded model '{model_file}'.")
         return response.json(None, status=HTTPStatus.NO_CONTENT)
@@ -1367,12 +1364,15 @@ def create_app(
     @ensure_loaded_agent(app)
     async def get_domain(request: Request) -> HTTPResponse:
         """Get current domain in yaml or json format."""
-        accepts = request.headers.get("Accept", default=JSON_CONTENT_TYPE)
+        # FIXME: this is a false positive mypy error after upgrading to 0.931
+        accepts = request.headers.get(  # type: ignore[call-overload]
+            "Accept", default=JSON_CONTENT_TYPE
+        )
         if accepts.endswith("json"):
-            domain = app.agent.domain.as_dict()
+            domain = app.ctx.agent.domain.as_dict()
             return response.json(domain)
         elif accepts.endswith("yml") or accepts.endswith("yaml"):
-            domain_yaml = app.agent.domain.as_yaml()
+            domain_yaml = app.ctx.agent.domain.as_yaml()
             return response.text(
                 domain_yaml, status=HTTPStatus.OK, content_type=YAML_CONTENT_TYPE
             )
@@ -1388,156 +1388,7 @@ def create_app(
                 f"header.",
             )
 
-    @app.post("/data/convert/<data_type>")
-    @requires_auth(app, auth_token)
-    async def post_data_convert(request: Request, data_type: Text):
-        """Converts Core/NLU training data between JSON/YAML/Markdown."""
-        data, input_format, output_format, language = _parse_convert_request(
-            request, data_type
-        )
-        temp_dir = tempfile.mkdtemp()
-        in_path = os.path.join(temp_dir, f"input.{input_format}")
-        out_path = os.path.join(temp_dir, f"input_converted.{output_format}")
-
-        if type(data) is dict:
-            rasa.shared.utils.io.dump_obj_as_json_to_file(
-                in_path, _split_metadata(data)
-            )
-        else:
-            rasa.shared.utils.io.write_text_file(data, in_path)
-
-        if data_type == "nlu":
-            await request.app.loop.run_in_executor(
-                None, partial(_convert_nlu_training_data, in_path, out_path, language),
-            )
-        else:
-            await _convert_core_training_data(in_path, out_path)
-
-        if output_format == "json":
-            data = rasa.shared.utils.io.read_json_file(out_path)
-            if data_type == "nlu":
-                data = _merge_metadata(data)
-        else:
-            data = rasa.shared.utils.io.read_file(out_path)
-
-        return response.json({"data": data})
-
     return app
-
-
-def _merge_metadata(data):
-    # rasa has a weird structured way to manage metadata so we flatten it
-    examples_with_proper_metadata = []
-    for example in data.get("rasa_nlu_data").get("common_examples", []):
-        metadata = example.pop("metadata", {})
-        metadata.update(metadata.pop("intent", {}))
-        metadata.update(metadata.pop("example", {}))
-        examples_with_proper_metadata.append({**example, "metadata": metadata})
-    data["rasa_nlu_data"]["common_examples"] = examples_with_proper_metadata
-    return data
-
-
-def _split_metadata(data):
-    common_examples = data.get("rasa_nlu_data", {}).get("common_examples", [])
-    if not common_examples:
-        return data
-    for ex in common_examples:
-        metadata = ex.get("metadata", {})
-        language = metadata.pop("language", None)
-        metadata = {"example": metadata} if metadata else {}
-        if language:
-            metadata["intent"] = {"language": language}
-        ex["metadata"] = metadata
-    data["rasa_nlu_data"]["common_examples"] = common_examples
-    return data
-
-
-def _parse_convert_request(request: Request, data_type: Text):
-    validate_request_body(
-        request, "You must provide training data to convert.",
-    )
-    if data_type not in ["nlu", "core"]:
-        raise ErrorResponse(
-            400,
-            "BadRequest",
-            f"Expected data type 'nlu' or 'core', but got 'f{data_type}'.",
-        )
-    rjs = request.json
-    data = rjs.get("data")
-    input_format = rjs.get("input_format")
-    output_format = rjs.get("output_format")
-    supported_formats = (
-        ["md", "json", "yaml", "yml"] if data_type == "nlu" else ["yaml", "yml"]
-    )
-    if output_format == "yaml":
-        output_format = "yml"
-
-    if not data or not input_format or not output_format:
-        raise ErrorResponse(
-            400,
-            "BadRequest",
-            "You must provide training data in the request body, as well as an input and output format.",
-        )
-
-    if output_format not in supported_formats:
-        raise ErrorResponse(
-            400,
-            "BadRequest",
-            f"Could not recognize output format '{output_format}'. Supported output formats: {', '.join(supported_formats)}.",
-        )
-
-    return data, input_format, output_format, rjs.get("language", "en")
-
-
-def _convert_nlu_training_data(
-    in_path: Text, out_path: Text, language: Text,
-):
-    # Since we failed to optimize NLU YAML reading to acceptable levels, the
-    # route can handle pre-parsed YAML.
-    if in_path.endswith("parsed_yaml"):
-        from rasa.shared.nlu.training_data.formats.rasa_yaml import (
-            RasaYAMLReader,
-            RasaYAMLWriter,
-        )
-
-        training_data = RasaYAMLReader().read_from_dict(
-            rasa.shared.utils.io.read_json_file(in_path)
-        )
-        if out_path.endswith("json"):
-            rasa.nlu.utils.write_to_file(out_path, training_data.nlu_as_json(indent=2))
-        elif out_path.endswith("md"):
-            rasa.nlu.utils.write_to_file(out_path, training_data.nlu_as_markdown())
-        else:
-            RasaYAMLWriter().dump(out_path, training_data)
-    elif rasa.shared.data.is_likely_yaml_file(out_path):
-        from rasa.shared.nlu.training_data.loading import load_data
-        from rasa.shared.nlu.training_data.formats.rasa_yaml import RasaYAMLWriter
-
-        training_data = load_data(in_path, language)
-        RasaYAMLWriter().dump(out_path, training_data)
-    else:
-        from rasa.nlu.convert import convert_training_data
-
-        convert_training_data(
-            in_path, out_path, Path(out_path).suffix.replace(".", ""), language,
-        )
-
-
-async def _convert_core_training_data(
-    in_path: Text, out_path: Text,
-):
-    from rasa.core.training.converters import StoryMarkdownToYamlConverter
-    from rasa.shared.core.training_data.story_reader.yaml_story_reader import (
-        YAMLStoryReader,
-    )
-
-    if rasa.shared.data.is_likely_markdown_file(in_path):
-        in_path = Path(in_path)
-        out_path = in_path.parent
-        await StoryMarkdownToYamlConverter.convert_and_write(in_path, out_path)
-    else:
-        steps = YAMLStoryReader().read_from_file(in_path)
-        YAMLStoryWriter().dump(out_path, steps)
 
 
 def _get_output_channel(
@@ -1562,7 +1413,7 @@ def _get_output_channel(
         requested_output_channel = tracker.get_latest_input_channel()
 
     # Interactive training does not set `input_channels`, hence we have to be cautious
-    registered_input_channels = getattr(request.app, "input_channels", None) or []
+    registered_input_channels = getattr(request.app.ctx, "input_channels", None) or []
     matching_channels = [
         channel
         for channel in registered_input_channels
@@ -1581,145 +1432,29 @@ def _get_output_channel(
 
 
 def _test_data_file_from_payload(request: Request, temporary_directory: Path) -> Text:
-    if request.headers.get("Content-type") == YAML_CONTENT_TYPE:
-        return str(
-            _training_payload_from_yaml(request, temporary_directory)["training_files"]
-        )
-    else:
-        return rasa.utils.io.create_temporary_file(
-            request.body, mode="w+b", suffix=".md"
-        )
-
-
-def _training_payload_from_json(
-    request: Request, temp_dir: Path
-) -> Dict[Text, Union[Text, bool]]:
-    logger.debug(
-        "Extracting JSON payload with Markdown training data from request body."
+    return str(
+        _training_payload_from_yaml(
+            request,
+            temporary_directory,
+            # test stories have to prefixed with `test_`
+            file_name=f"{TEST_STORIES_FILE_PREFIX}data.yml",
+        )["training_files"]
     )
-
-    request_payload = request.json
-    _validate_json_training_payload(request_payload)
-
-    # bf >>
-    # config_path = os.path.join(temp_dir, "config.yml")
-
-    # rasa.shared.utils.io.write_text_file(request_payload["config"], config_path)
-
-    config_paths = []
-    for key in request_payload["config"].keys():
-        config_path = os.path.join(temp_dir, "config-{}.yml".format(key))
-        rasa.shared.utils.io.write_text_file(
-            request_payload["config"][key], config_path
-        )
-        config_paths += [config_path]
-
-    if "nlu" in request_payload:
-        nlu_dir = os.path.join(temp_dir, "nlu")
-        os.mkdir(nlu_dir)
-
-        for key in request_payload["nlu"].keys():
-            nlu_path = os.path.join(nlu_dir, "{}.json".format(key))
-            rasa.shared.utils.io.dump_obj_as_json_to_file(
-                nlu_path, request_payload["nlu"][key]
-            )
-
-    if "augmentation_factor" in request_payload:
-        augmentation_factor = request_payload["augmentation_factor"]
-    else:
-        augmentation_factor = os.environ.get("AUGMENTATION_FACTOR", 50)
-
-    if "fragments" in request_payload:
-        fragments_path = os.path.join(temp_dir, "fragments.yml")
-        rasa.shared.utils.io.write_text_file(
-            request_payload["fragments"], fragments_path
-        )
-
-    # << bf
-
-    if "responses" in request_payload:
-        responses_path = os.path.join(temp_dir, "responses.md")
-        rasa.shared.utils.io.write_text_file(
-            request_payload["responses"], responses_path
-        )
-
-    domain_path = DEFAULT_DOMAIN_PATH
-    if "domain" in request_payload:
-        domain_path = os.path.join(temp_dir, "domain.yml")
-        rasa.shared.utils.io.write_text_file(request_payload["domain"], domain_path)
-
-    model_output_directory = str(temp_dir)
-    if request_payload.get(
-        "save_to_default_model_directory",
-        request.args.get("save_to_default_model_directory", True),
-    ):
-        model_output_directory = DEFAULT_MODELS_PATH
-
-    return dict(
-        domain=domain_path,
-        config=config_paths,  # bf
-        training_files=str(temp_dir),
-        output=os.environ.get("MODEL_PATH", DEFAULT_MODELS_PATH),  # bf
-        force_training=request_payload.get(
-            "force", request.args.get("force_training", False)
-        ),
-        fixed_model_name=request_payload.get("fixed_model_name"),  # bf
-        persist_nlu_training_data=True,  # bf
-        core_additional_arguments={
-            "augmentation_factor": int(augmentation_factor),
-        },  # bf
-    )
-
-
-def _validate_json_training_payload(rjs: Dict):
-    if "config" not in rjs:
-        raise ErrorResponse(
-            HTTPStatus.BAD_REQUEST,
-            "BadRequest",
-            "The training request is missing the required key `config`.",
-            {"parameter": "config", "in": "body"},
-        )
-
-    if "nlu" not in rjs and "stories" not in rjs:
-        raise ErrorResponse(
-            HTTPStatus.BAD_REQUEST,
-            "BadRequest",
-            "To train a Rasa model you need to specify at least one type of "
-            "training data. Add `nlu` and/or `stories` to the request.",
-            {"parameters": ["nlu", "stories"], "in": "body"},
-        )
-
-    if "stories" in rjs and "domain" not in rjs:
-        raise ErrorResponse(
-            HTTPStatus.BAD_REQUEST,
-            "BadRequest",
-            "To train a Rasa model with story training data, you also need to "
-            "specify the `domain`.",
-            {"parameter": "domain", "in": "body"},
-        )
-
-    if "force" in rjs or "save_to_default_model_directory" in rjs:
-        rasa.shared.utils.io.raise_deprecation_warning(
-            "Specifying 'force' and 'save_to_default_model_directory' as part of the "
-            "JSON payload is deprecated. Please use the header arguments "
-            "'force_training' and 'save_to_default_model_directory'.",
-            docs=_docs("/api/http-api"),
-        )
 
 
 def _training_payload_from_yaml(
-    request: Request, temp_dir: Path
-) -> Dict[Text, Union[Text, bool]]:
+    request: Request, temp_dir: Path, file_name: Text = "data.yml"
+) -> Dict[Text, Any]:
     logger.debug("Extracting YAML training data from request body.")
 
     decoded = request.body.decode(rasa.shared.utils.io.DEFAULT_ENCODING)
     _validate_yaml_training_payload(decoded)
 
-    training_data = temp_dir / "data.yml"
+    training_data = temp_dir / file_name
     rasa.shared.utils.io.write_text_file(decoded, training_data)
 
     model_output_directory = str(temp_dir)
-    if request.args.get("save_to_default_model_directory", True):
+    if rasa.utils.endpoints.bool_arg(request, "save_to_default_model_directory", True):
         model_output_directory = DEFAULT_MODELS_PATH
 
     return dict(
@@ -1727,7 +1462,9 @@ def _training_payload_from_yaml(
         config=str(training_data),
         training_files=str(temp_dir),
         output=model_output_directory,
-        force_training=request.args.get("force_training", False),
+        force_training=rasa.utils.endpoints.bool_arg(request, "force_training", False),
+        core_additional_arguments=_extract_core_additional_arguments(request),
+        nlu_additional_arguments=_extract_nlu_additional_arguments(request),
     )
 
 
@@ -1741,3 +1478,13 @@ def _validate_yaml_training_payload(yaml_text: Text) -> None:
             f"The request body does not contain valid YAML. Error: {e}",
             help_url=DOCS_URL_TRAINING_DATA,
         )
+
+
+def _extract_core_additional_arguments(request: Request) -> Dict[Text, Any]:
+    return {
+        "augmentation_factor": rasa.utils.endpoints.int_arg(request, "augmentation", 50)
+    }
+
+
+def _extract_nlu_additional_arguments(request: Request) -> Dict[Text, Any]:
+    return {"num_threads": rasa.utils.endpoints.int_arg(request, "num_threads", 1)}

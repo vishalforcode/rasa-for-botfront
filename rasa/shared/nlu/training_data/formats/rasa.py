@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class RasaReader(JsonTrainingDataReader):
-    def read_from_json(self, js: Dict[Text, Any], **_) -> "TrainingData":
+    def read_from_json(self, js: Dict[Text, Any], **_: Any) -> "TrainingData":
         """Loads training data stored in the rasa NLU data format."""
         import rasa.shared.nlu.training_data.schemas.data_schema as schema
         import rasa.shared.utils.validation as validation_utils
@@ -29,7 +29,6 @@ class RasaReader(JsonTrainingDataReader):
         entity_synonyms = data.get("entity_synonyms", [])
         regex_features = data.get("regex_features", [])
         lookup_tables = data.get("lookup_tables", [])
-        gazette = data.get("gazette", [])
 
         entity_synonyms = transform_entity_synonyms(entity_synonyms)
 
@@ -45,12 +44,12 @@ class RasaReader(JsonTrainingDataReader):
             training_examples.append(msg)
 
         return TrainingData(
-            training_examples, entity_synonyms, regex_features, lookup_tables, gazette
+            training_examples, entity_synonyms, regex_features, lookup_tables
         )
 
 
 class RasaWriter(TrainingDataWriter):
-    def dumps(self, training_data: "TrainingData", **kwargs) -> Text:
+    def dumps(self, training_data: "TrainingData", **kwargs: Any) -> Text:
         """Writes Training Data to a string in json format."""
 
         js_entity_synonyms = defaultdict(list)
@@ -74,7 +73,6 @@ class RasaWriter(TrainingDataWriter):
                     "regex_features": training_data.regex_features,
                     "lookup_tables": training_data.lookup_tables,
                     "entity_synonyms": formatted_synonyms,
-                    "gazette": training_data.gazette,
                 }
             },
             **kwargs,

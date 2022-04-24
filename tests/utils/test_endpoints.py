@@ -1,11 +1,13 @@
 import logging
-from typing import Text
+from pathlib import Path
+from typing import Text, Optional, Union
+from unittest.mock import Mock
 
 import pytest
 from aioresponses import aioresponses
 
+from rasa.shared.exceptions import FileNotFoundException
 from tests.utilities import latest_request, json_of_latest_request
-from tests.core.conftest import DEFAULT_ENDPOINTS_FILE
 import rasa.utils.endpoints as endpoint_utils
 
 
@@ -92,6 +94,34 @@ async def test_endpoint_config():
             assert s._default_auth.password == "pass"
 
 
+async def test_endpoint_config_with_cafile(tmp_path: Path):
+    cafile = "data/test_endpoints/cert.pem"
+
+    with aioresponses() as mocked:
+        endpoint = endpoint_utils.EndpointConfig(
+            "https://example.com/", cafile=str(cafile)
+        )
+
+        mocked.post("https://example.com/", status=200)
+
+        await endpoint.request("post")
+
+        request = latest_request(mocked, "post", "https://example.com/")[-1]
+
+        ssl_context = request.kwargs["ssl"]
+        certs = ssl_context.get_ca_certs()
+        assert certs[0]["subject"][4][0] == ("organizationalUnitName", "rasa")
+
+
+async def test_endpoint_config_with_non_existent_cafile(tmp_path: Path):
+    cafile = "data/test_endpoints/no_file.pem"
+
+    endpoint = endpoint_utils.EndpointConfig("https://example.com/", cafile=str(cafile))
+
+    with pytest.raises(FileNotFoundException):
+        await endpoint.request("post")
+
+
 def test_endpoint_config_default_token_name():
     test_data = {"url": "http://test", "token": "token"}
 
@@ -125,7 +155,8 @@ async def test_request_non_json_response():
 
 
 @pytest.mark.parametrize(
-    "filename, endpoint_type", [(DEFAULT_ENDPOINTS_FILE, "tracker_store"),],
+    "filename, endpoint_type",
+    [("data/test_endpoints/example_endpoints.yml", "tracker_store")],
 )
 def test_read_endpoint_config(filename: Text, endpoint_type: Text):
     conf = endpoint_utils.read_endpoint_config(filename, endpoint_type)
@@ -133,14 +164,70 @@ def test_read_endpoint_config(filename: Text, endpoint_type: Text):
 
 
 @pytest.mark.parametrize(
+    "endpoint_type, cafile",
+    [("action_endpoint", "./some_test_file"), ("tracker_store", None)],
+)
+def test_read_endpoint_config_with_cafile(endpoint_type: Text, cafile: Optional[Text]):
+    conf = endpoint_utils.read_endpoint_config(
+        "data/test_endpoints/example_endpoints.yml", endpoint_type
+    )
+    assert conf.cafile == cafile
+
+
+@pytest.mark.parametrize(
     "filename, endpoint_type",
     [
         ("", "tracker_store"),
-        (DEFAULT_ENDPOINTS_FILE, "stuff"),
-        (DEFAULT_ENDPOINTS_FILE, "empty"),
+        ("data/test_endpoints/example_endpoints.yml", "stuff"),
+        ("data/test_endpoints/example_endpoints.yml", "empty"),
         ("/unknown/path.yml", "tracker_store"),
     ],
 )
 def test_read_endpoint_config_not_found(filename: Text, endpoint_type: Text):
     conf = endpoint_utils.read_endpoint_config(filename, endpoint_type)
     assert conf is None
+
+
+@pytest.mark.parametrize(
+    "value, default, expected_result",
+    [
+        (None, True, True),
+        (False, True, False),
+        ("false", True, False),
+        ("true", False, True),
+    ],
+)
+def test_bool_arg(
+    value: Optional[Union[bool, str]], default: bool, expected_result: bool
+):
+    request = Mock()
+    request.args = {}
+    if value is not None:
+        request.args = {"key": value}
+    assert endpoint_utils.bool_arg(request, "key", default) == expected_result
+
+
+@pytest.mark.parametrize(
+    "value, default, expected_result",
+    [(None, 0.5, 0.5), (0.5, None, 0.5), ("0.5", 0, 0.5), ("a", 0.5, 0.5)],
+)
+def test_float_arg(
+    value: Optional[Union[float, str]], default: float, expected_result: float
+):
+    request = Mock()
+    request.args = {}
+    if value is not None:
+        request.args = {"key": value}
+    assert endpoint_utils.float_arg(request, "key", default) == expected_result
+
+
+@pytest.mark.parametrize(
+    "value, default, expected_result",
+    [(None, 0, 0), (1, 0, 1), ("1", 0, 1), ("a", 0, 0)],
+)
+def test_int_arg(value: Optional[Union[int, str]], default: int, expected_result: int):
+    request = Mock()
+    request.args = {}
+    if value is not None:
+        request.args = {"key": value}
+    assert endpoint_utils.int_arg(request, "key", default) == expected_result

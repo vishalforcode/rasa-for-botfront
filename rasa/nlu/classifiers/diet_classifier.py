@@ -1,35 +1,41 @@
+from __future__ import annotations
 import copy
 import logging
 from collections import defaultdict
 from pathlib import Path
 
+from rasa.exceptions import ModelNotFound
+from rasa.nlu.featurizers.featurizer import Featurizer
+
 import numpy as np
-import os
 import scipy.sparse
 import tensorflow as tf
 
 from typing import Any, Dict, List, Optional, Text, Tuple, Union, Type
 
+from rasa.engine.graph import ExecutionContext, GraphComponent
+from rasa.engine.recipes.default_recipe import DefaultV1Recipe
+from rasa.engine.storage.resource import Resource
+from rasa.engine.storage.storage import ModelStorage
+from rasa.nlu.extractors.extractor import EntityExtractorMixin
+from rasa.nlu.classifiers.classifier import IntentClassifier
 import rasa.shared.utils.io
 import rasa.utils.io as io_utils
 import rasa.nlu.utils.bilou_utils as bilou_utils
-import rasa.utils.tensorflow.numpy
 from rasa.shared.constants import DIAGNOSTIC_DATA
-from rasa.nlu.featurizers.featurizer import Featurizer
-from rasa.nlu.components import Component
-from rasa.nlu.classifiers.classifier import IntentClassifier
-from rasa.nlu.extractors.extractor import EntityExtractor, EntityTagSpec
+from rasa.nlu.extractors.extractor import EntityTagSpec
 from rasa.nlu.classifiers import LABEL_RANKING_LENGTH
 from rasa.utils import train_utils
-from rasa.utils.tensorflow import layers
+from rasa.utils.tensorflow import rasa_layers
 from rasa.utils.tensorflow.models import RasaModel, TransformerRasaModel
 from rasa.utils.tensorflow.model_data import (
     RasaModelData,
     FeatureSignature,
     FeatureArray,
 )
-from rasa.nlu.constants import TOKENS_NAMES
+from rasa.nlu.constants import TOKENS_NAMES, DEFAULT_TRANSFORMER_SIZE
 from rasa.shared.nlu.constants import (
+    SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
     TEXT,
     INTENT,
     INTENT_RESPONSE_KEY,
@@ -40,15 +46,14 @@ from rasa.shared.nlu.constants import (
     NO_ENTITY_TAG,
     SPLIT_ENTITIES_BY_COMMA,
 )
-from rasa.nlu.config import RasaNLUModelConfig
 from rasa.shared.exceptions import InvalidConfigException
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.message import Message
-from rasa.nlu.model import Metadata
 from rasa.utils.tensorflow.constants import (
     LABEL,
     IDS,
     HIDDEN_LAYERS_SIZES,
+    RENORMALIZE_CONFIDENCES,
     SHARE_HIDDEN_LAYERS,
     TRANSFORMER_SIZE,
     NUM_TRANSFORMER_LAYERS,
@@ -73,7 +78,7 @@ from rasa.utils.tensorflow.constants import (
     UNIDIRECTIONAL_ENCODER,
     DROP_RATE,
     DROP_RATE_ATTENTION,
-    WEIGHT_SPARSITY,
+    CONNECTION_DENSITY,
     NEGATIVE_MARGIN_SCALE,
     REGULARIZATION_CONSTANT,
     SCALE_LOSS,
@@ -104,7 +109,6 @@ from rasa.utils.tensorflow.constants import (
 
 logger = logging.getLogger(__name__)
 
-
 SPARSE = "sparse"
 DENSE = "dense"
 LABEL_KEY = LABEL
@@ -113,7 +117,14 @@ LABEL_SUB_KEY = IDS
 POSSIBLE_TAGS = [ENTITY_ATTRIBUTE_TYPE, ENTITY_ATTRIBUTE_ROLE, ENTITY_ATTRIBUTE_GROUP]
 
 
-class DIETClassifier(IntentClassifier, EntityExtractor):
+@DefaultV1Recipe.register(
+    [
+        DefaultV1Recipe.ComponentType.INTENT_CLASSIFIER,
+        DefaultV1Recipe.ComponentType.ENTITY_EXTRACTOR,
+    ],
+    is_trainable=True,
+)
+class DIETClassifier(GraphComponent, IntentClassifier, EntityExtractorMixin):
     """A multi-task model for intent classification and entity extraction.
 
     DIET is Dual Intent and Entity Transformer.
@@ -127,136 +138,195 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     """
 
     @classmethod
-    def required_components(cls) -> List[Type[Component]]:
+    def required_components(cls) -> List[Type]:
+        """Components that should be included in the pipeline before this component."""
         return [Featurizer]
 
-    # please make sure to update the docs when changing a default parameter
-    defaults = {
-        # ## Architecture of the used neural network
-        # Hidden layer sizes for layers before the embedding layers for user message
-        # and labels.
-        # The number of hidden layers is equal to the length of the corresponding list.
-        HIDDEN_LAYERS_SIZES: {TEXT: [], LABEL: []},
-        # Whether to share the hidden layer weights between user message and labels.
-        SHARE_HIDDEN_LAYERS: False,
-        # Number of units in transformer
-        TRANSFORMER_SIZE: 256,
-        # Number of transformer layers
-        NUM_TRANSFORMER_LAYERS: 2,
-        # Number of attention heads in transformer
-        NUM_HEADS: 4,
-        # If 'True' use key relative embeddings in attention
-        KEY_RELATIVE_ATTENTION: False,
-        # If 'True' use value relative embeddings in attention
-        VALUE_RELATIVE_ATTENTION: False,
-        # Max position for relative embeddings
-        MAX_RELATIVE_POSITION: None,
-        # Use a unidirectional or bidirectional encoder.
-        UNIDIRECTIONAL_ENCODER: False,
-        # ## Training parameters
-        # Initial and final batch sizes:
-        # Batch size will be linearly increased for each epoch.
-        BATCH_SIZES: [64, 256],
-        # Strategy used when creating batches.
-        # Can be either 'sequence' or 'balanced'.
-        BATCH_STRATEGY: BALANCED,
-        # Number of epochs to train
-        EPOCHS: 300,
-        # Set random seed to any 'int' to get reproducible results
-        RANDOM_SEED: None,
-        # Initial learning rate for the optimizer
-        LEARNING_RATE: 0.001,
-        # ## Parameters for embeddings
-        # Dimension size of embedding vectors
-        EMBEDDING_DIMENSION: 20,
-        # Dense dimension to use for sparse features.
-        DENSE_DIMENSION: {TEXT: 128, LABEL: 20},
-        # Default dimension to use for concatenating sequence and sentence features.
-        CONCAT_DIMENSION: {TEXT: 128, LABEL: 20},
-        # The number of incorrect labels. The algorithm will minimize
-        # their similarity to the user input during training.
-        NUM_NEG: 20,
-        # Type of similarity measure to use, either 'auto' or 'cosine' or 'inner'.
-        SIMILARITY_TYPE: AUTO,
-        # The type of the loss function, either 'cross_entropy' or 'margin'.
-        LOSS_TYPE: CROSS_ENTROPY,
-        # Number of top intents to normalize scores for. Applicable with
-        # loss type 'cross_entropy' and 'softmax' confidences. Set to 0
-        # to turn off normalization.
-        RANKING_LENGTH: 10,
-        # Indicates how similar the algorithm should try to make embedding vectors
-        # for correct labels.
-        # Should be 0.0 < ... < 1.0 for 'cosine' similarity type.
-        MAX_POS_SIM: 0.8,
-        # Maximum negative similarity for incorrect labels.
-        # Should be -1.0 < ... < 1.0 for 'cosine' similarity type.
-        MAX_NEG_SIM: -0.4,
-        # If 'True' the algorithm only minimizes maximum similarity over
-        # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
-        USE_MAX_NEG_SIM: True,
-        # If 'True' scale loss inverse proportionally to the confidence
-        # of the correct prediction
-        SCALE_LOSS: False,
-        # ## Regularization parameters
-        # The scale of regularization
-        REGULARIZATION_CONSTANT: 0.002,
-        # The scale of how important is to minimize the maximum similarity
-        # between embeddings of different labels,
-        # used only if 'loss_type' is set to 'margin'.
-        NEGATIVE_MARGIN_SCALE: 0.8,
-        # Dropout rate for encoder
-        DROP_RATE: 0.2,
-        # Dropout rate for attention
-        DROP_RATE_ATTENTION: 0,
-        # Sparsity of the weights in dense layers
-        WEIGHT_SPARSITY: 0.8,
-        # If 'True' apply dropout to sparse input tensors
-        SPARSE_INPUT_DROPOUT: True,
-        # If 'True' apply dropout to dense input tensors
-        DENSE_INPUT_DROPOUT: True,
-        # ## Evaluation parameters
-        # How often calculate validation accuracy.
-        # Small values may hurt performance, e.g. model accuracy.
-        EVAL_NUM_EPOCHS: 20,
-        # How many examples to use for hold out validation set
-        # Large values may hurt performance, e.g. model accuracy.
-        EVAL_NUM_EXAMPLES: 0,
-        # ## Model config
-        # If 'True' intent classification is trained and intent predicted.
-        INTENT_CLASSIFICATION: True,
-        # If 'True' named entity recognition is trained and entities predicted.
-        ENTITY_RECOGNITION: True,
-        # If 'True' random tokens of the input message will be masked and the model
-        # should predict those tokens.
-        MASKED_LM: False,
-        # 'BILOU_flag' determines whether to use BILOU tagging or not.
-        # If set to 'True' labelling is more rigorous, however more
-        # examples per entity are required.
-        # Rule of thumb: you should have more than 100 examples per entity.
-        BILOU_FLAG: True,
-        # If you want to use tensorboard to visualize training and validation metrics,
-        # set this option to a valid output directory.
-        TENSORBOARD_LOG_DIR: None,
-        # Define when training metrics for tensorboard should be logged.
-        # Either after every epoch or for every training step.
-        # Valid values: 'epoch' and 'minibatch'
-        TENSORBOARD_LOG_LEVEL: "epoch",
-        # Perform model checkpointing
-        CHECKPOINT_MODEL: False,
-        # Specify what features to use as sequence and sentence features
-        # By default all features in the pipeline are used.
-        FEATURIZERS: [],
-        # Split entities by comma, this makes sense e.g. for a list of ingredients
-        # in a recipie, but it doesn't make sense for the parts of an address
-        SPLIT_ENTITIES_BY_COMMA: True,
-        # If 'True' applies sigmoid on all similarity terms and adds
-        # it to the loss function to ensure that similarity values are
-        # approximately bounded. Used inside softmax loss only.
-        CONSTRAIN_SIMILARITIES: False,
-        # Model confidence to be returned during inference. Possible values -
-        # 'softmax', 'cosine', 'inner'.
-        MODEL_CONFIDENCE: SOFTMAX,
-    }
+    @staticmethod
+    def get_default_config() -> Dict[Text, Any]:
+        """The component's default config (see parent class for full docstring)."""
+        # please make sure to update the docs when changing a default parameter
+        return {
+            # ## Architecture of the used neural network
+            # Hidden layer sizes for layers before the embedding layers for user message
+            # and labels.
+            # The number of hidden layers is equal to the length of the corresponding
+            # list.
+            HIDDEN_LAYERS_SIZES: {TEXT: [], LABEL: []},
+            # Whether to share the hidden layer weights between user message and labels.
+            SHARE_HIDDEN_LAYERS: False,
+            # Number of units in transformer
+            TRANSFORMER_SIZE: DEFAULT_TRANSFORMER_SIZE,
+            # Number of transformer layers
+            NUM_TRANSFORMER_LAYERS: 2,
+            # Number of attention heads in transformer
+            NUM_HEADS: 4,
+            # If 'True' use key relative embeddings in attention
+            KEY_RELATIVE_ATTENTION: False,
+            # If 'True' use value relative embeddings in attention
+            VALUE_RELATIVE_ATTENTION: False,
+            # Max position for relative embeddings. Only in effect if key- or value
+            # relative attention are turned on
+            MAX_RELATIVE_POSITION: 5,
+            # Use a unidirectional or bidirectional encoder.
+            UNIDIRECTIONAL_ENCODER: False,
+            # ## Training parameters
+            # Initial and final batch sizes:
+            # Batch size will be linearly increased for each epoch.
+            BATCH_SIZES: [64, 256],
+            # Strategy used when creating batches.
+            # Can be either 'sequence' or 'balanced'.
+            BATCH_STRATEGY: BALANCED,
+            # Number of epochs to train
+            EPOCHS: 300,
+            # Set random seed to any 'int' to get reproducible results
+            RANDOM_SEED: None,
+            # Initial learning rate for the optimizer
+            LEARNING_RATE: 0.001,
+            # ## Parameters for embeddings
+            # Dimension size of embedding vectors
+            EMBEDDING_DIMENSION: 20,
+            # Dense dimension to use for sparse features.
+            DENSE_DIMENSION: {TEXT: 128, LABEL: 20},
+            # Default dimension to use for concatenating sequence and sentence features.
+            CONCAT_DIMENSION: {TEXT: 128, LABEL: 20},
+            # The number of incorrect labels. The algorithm will minimize
+            # their similarity to the user input during training.
+            NUM_NEG: 20,
+            # Type of similarity measure to use, either 'auto' or 'cosine' or 'inner'.
+            SIMILARITY_TYPE: AUTO,
+            # The type of the loss function, either 'cross_entropy' or 'margin'.
+            LOSS_TYPE: CROSS_ENTROPY,
+            # Number of top intents for which confidences should be reported.
+            # Set to 0 if confidences for all intents should be reported.
+            RANKING_LENGTH: LABEL_RANKING_LENGTH,
+            # Indicates how similar the algorithm should try to make embedding vectors
+            # for correct labels.
+            # Should be 0.0 < ... < 1.0 for 'cosine' similarity type.
+            MAX_POS_SIM: 0.8,
+            # Maximum negative similarity for incorrect labels.
+            # Should be -1.0 < ... < 1.0 for 'cosine' similarity type.
+            MAX_NEG_SIM: -0.4,
+            # If 'True' the algorithm only minimizes maximum similarity over
+            # incorrect intent labels, used only if 'loss_type' is set to 'margin'.
+            USE_MAX_NEG_SIM: True,
+            # If 'True' scale loss inverse proportionally to the confidence
+            # of the correct prediction
+            SCALE_LOSS: False,
+            # ## Regularization parameters
+            # The scale of regularization
+            REGULARIZATION_CONSTANT: 0.002,
+            # The scale of how important is to minimize the maximum similarity
+            # between embeddings of different labels,
+            # used only if 'loss_type' is set to 'margin'.
+            NEGATIVE_MARGIN_SCALE: 0.8,
+            # Dropout rate for encoder
+            DROP_RATE: 0.2,
+            # Dropout rate for attention
+            DROP_RATE_ATTENTION: 0,
+            # Fraction of trainable weights in internal layers.
+            CONNECTION_DENSITY: 0.2,
+            # If 'True' apply dropout to sparse input tensors
+            SPARSE_INPUT_DROPOUT: True,
+            # If 'True' apply dropout to dense input tensors
+            DENSE_INPUT_DROPOUT: True,
+            # ## Evaluation parameters
+            # How often calculate validation accuracy.
+            # Small values may hurt performance.
+            EVAL_NUM_EPOCHS: 20,
+            # How many examples to use for hold out validation set
+            # Large values may hurt performance, e.g. model accuracy.
+            # Set to 0 for no validation.
+            EVAL_NUM_EXAMPLES: 0,
+            # ## Model config
+            # If 'True' intent classification is trained and intent predicted.
+            INTENT_CLASSIFICATION: True,
+            # If 'True' named entity recognition is trained and entities predicted.
+            ENTITY_RECOGNITION: True,
+            # If 'True' random tokens of the input message will be masked and the model
+            # should predict those tokens.
+            MASKED_LM: False,
+            # 'BILOU_flag' determines whether to use BILOU tagging or not.
+            # If set to 'True' labelling is more rigorous, however more
+            # examples per entity are required.
+            # Rule of thumb: you should have more than 100 examples per entity.
+            BILOU_FLAG: True,
+            # If you want to use tensorboard to visualize training and validation
+            # metrics, set this option to a valid output directory.
+            TENSORBOARD_LOG_DIR: None,
+            # Define when training metrics for tensorboard should be logged.
+            # Either after every epoch or for every training step.
+            # Valid values: 'epoch' and 'batch'
+            TENSORBOARD_LOG_LEVEL: "epoch",
+            # Perform model checkpointing
+            CHECKPOINT_MODEL: False,
+            # Specify what features to use as sequence and sentence features
+            # By default all features in the pipeline are used.
+            FEATURIZERS: [],
+            # Split entities by comma, this makes sense e.g. for a list of ingredients
+            # in a recipie, but it doesn't make sense for the parts of an address
+            SPLIT_ENTITIES_BY_COMMA: True,
+            # If 'True' applies sigmoid on all similarity terms and adds
+            # it to the loss function to ensure that similarity values are
+            # approximately bounded. Used inside cross-entropy loss only.
+            CONSTRAIN_SIMILARITIES: False,
+            # Model confidence to be returned during inference. Currently, the only
+            # possible value is `softmax`.
+            MODEL_CONFIDENCE: SOFTMAX,
+            # Determines whether the confidences of the chosen top intents should be
+            # renormalized so that they sum up to 1. By default, we do not renormalize
+            # and return the confidences for the top intents as is.
+            # Note that renormalization only makes sense if confidences are generated
+            # via `softmax`.
+            RENORMALIZE_CONFIDENCES: False,
+        }
+
+    def __init__(
+        self,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+        index_label_id_mapping: Optional[Dict[int, Text]] = None,
+        entity_tag_specs: Optional[List[EntityTagSpec]] = None,
+        model: Optional[RasaModel] = None,
+        sparse_feature_sizes: Optional[Dict[Text, Dict[Text, List[int]]]] = None,
+    ) -> None:
+        """Declare instance variables with default values."""
+        if EPOCHS not in config:
+            rasa.shared.utils.io.raise_warning(
+                f"Please configure the number of '{EPOCHS}' in your configuration file."
+                f" We will change the default value of '{EPOCHS}' in the future to 1. "
+            )
+
+        self.component_config = config
+        self._model_storage = model_storage
+        self._resource = resource
+        self._execution_context = execution_context
+
+        self._check_config_parameters()
+
+        # transform numbers to labels
+        self.index_label_id_mapping = index_label_id_mapping or {}
+
+        self._entity_tag_specs = entity_tag_specs
+
+        self.model = model
+
+        self.tmp_checkpoint_dir = None
+        if self.component_config[CHECKPOINT_MODEL]:
+            self.tmp_checkpoint_dir = Path(rasa.utils.io.create_temporary_directory())
+
+        self._label_data: Optional[RasaModelData] = None
+        self._data_example: Optional[Dict[Text, Dict[Text, List[FeatureArray]]]] = None
+
+        self.split_entities_config = rasa.utils.train_utils.init_split_entities(
+            self.component_config[SPLIT_ENTITIES_BY_COMMA],
+            SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
+        )
+
+        self.finetune_mode = self._execution_context.is_finetuning
+        self._sparse_feature_sizes = sparse_feature_sizes
 
     # init helpers
     def _check_masked_lm(self) -> None:
@@ -301,10 +371,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         train_utils.validate_configuration_settings(self.component_config)
 
-        self.component_config = train_utils.update_deprecated_loss_type(
-            self.component_config
-        )
-
         self.component_config = train_utils.update_similarity_type(
             self.component_config
         )
@@ -312,52 +378,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             self.component_config
         )
 
-    # package safety checks
     @classmethod
-    def required_packages(cls) -> List[Text]:
-        return ["tensorflow"]
-
-    def __init__(
-        self,
-        component_config: Optional[Dict[Text, Any]] = None,
-        index_label_id_mapping: Optional[Dict[int, Text]] = None,
-        entity_tag_specs: Optional[List[EntityTagSpec]] = None,
-        model: Optional[RasaModel] = None,
-        finetune_mode: bool = False,
-    ) -> None:
-        """Declare instance variables with default values."""
-        if component_config is not None and EPOCHS not in component_config:
-            rasa.shared.utils.io.raise_warning(
-                f"Please configure the number of '{EPOCHS}' in your configuration file."
-                f" We will change the default value of '{EPOCHS}' in the future to 1. "
-            )
-
-        super().__init__(component_config)
-
-        self._check_config_parameters()
-
-        # transform numbers to labels
-        self.index_label_id_mapping = index_label_id_mapping
-
-        self._entity_tag_specs = entity_tag_specs
-
-        self.model = model
-
-        self._label_data: Optional[RasaModelData] = None
-        self._data_example: Optional[Dict[Text, List[FeatureArray]]] = None
-
-        self.split_entities_config = self.init_split_entities()
-
-        self.finetune_mode = finetune_mode
-
-        if not self.model and self.finetune_mode:
-            raise rasa.shared.exceptions.InvalidParameterException(
-                f"{self.__class__.__name__} was instantiated "
-                f"with `model=None` and `finetune_mode=True`. "
-                f"This is not a valid combination as the component "
-                f"needs an already instantiated and trained model "
-                f"to continue training in finetune mode."
-            )
+    def create(
+        cls,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
+    ) -> DIETClassifier:
+        """Creates a new untrained component (see parent class for full docstring)."""
+        return cls(config, model_storage, resource, execution_context)
 
     @property
     def label_key(self) -> Optional[Text]:
@@ -470,6 +500,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     def _extract_features(
         self, message: Message, attribute: Text
     ) -> Dict[Text, Union[scipy.sparse.spmatrix, np.ndarray]]:
+
         (
             sparse_sequence_features,
             sparse_sentence_features,
@@ -550,7 +581,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             label_features = self._extract_features(e, attribute)
             for feature_key, feature_value in label_features.items():
                 features[feature_key].append(feature_value)
-
         sequence_features = []
         sentence_features = []
         for feature_name, feature_value in features.items():
@@ -562,7 +592,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                 sentence_features.append(
                     FeatureArray(np.array(feature_value), number_of_dimensions=3)
                 )
-
         return sequence_features, sentence_features
 
     @staticmethod
@@ -605,7 +634,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         # Sort the list of tuples based on label_idx
         labels_idx_examples = sorted(labels_idx_examples, key=lambda x: x[0])
         labels_example = [example for (_, example) in labels_idx_examples]
-
         # Collect features, precomputed if they exist, else compute on the fly
         if self._check_labels_features_exist(labels_example, attribute):
             (
@@ -619,7 +647,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         label_data = RasaModelData()
         label_data.add_features(LABEL, SEQUENCE, sequence_features)
         label_data.add_features(LABEL, SENTENCE, sentence_features)
-
         if label_data.does_feature_not_exist(
             LABEL, SENTENCE
         ) and label_data.does_feature_not_exist(LABEL, SEQUENCE):
@@ -641,7 +668,11 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         return label_data
 
     def _use_default_label_features(self, label_ids: np.ndarray) -> List[FeatureArray]:
-        all_label_features = self._label_data.get(LABEL, SENTENCE)[0]
+        if self._label_data is None:
+            return []
+
+        feature_arrays: List[FeatureArray] = self._label_data.get(LABEL, SENTENCE)
+        all_label_features = feature_arrays[0]
         return [
             FeatureArray(
                 np.array([all_label_features[label_id] for label_id in label_ids]),
@@ -680,11 +711,22 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                 example for example in training_data if label_attribute in example.data
             ]
 
+        training_data = [
+            message
+            for message in training_data
+            if message.features_present(
+                attribute=TEXT, featurizers=self.component_config.get(FEATURIZERS)
+            )
+        ]
+
         if not training_data:
             # no training data are present to train
             return RasaModelData()
 
-        features_for_examples = model_data_utils.featurize_training_examples(
+        (
+            features_for_examples,
+            sparse_feature_sizes,
+        ) = model_data_utils.featurize_training_examples(
             training_data,
             attributes_to_consider,
             entity_tag_specs=self._entity_tag_specs,
@@ -700,6 +742,12 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         )
         model_data.add_data(attribute_data)
         model_data.add_lengths(TEXT, SEQUENCE_LENGTH, TEXT, SEQUENCE)
+        # Current implementation doesn't yet account for updating sparse
+        # feature sizes of label attributes. That's why we remove them.
+        sparse_feature_sizes = self._remove_label_sparse_feature_sizes(
+            sparse_feature_sizes=sparse_feature_sizes, label_attribute=label_attribute
+        )
+        model_data.add_sparse_feature_sizes(sparse_feature_sizes)
 
         self._add_label_features(
             model_data, training_data, label_attribute, label_id_dict, training
@@ -712,6 +760,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         return model_data
 
+    @staticmethod
+    def _remove_label_sparse_feature_sizes(
+        sparse_feature_sizes: Dict[Text, Dict[Text, List[int]]],
+        label_attribute: Optional[Text] = None,
+    ) -> Dict[Text, Dict[Text, List[int]]]:
+
+        if label_attribute in sparse_feature_sizes:
+            del sparse_feature_sizes[label_attribute]
+        return sparse_feature_sizes
+
     def _add_label_features(
         self,
         model_data: RasaModelData,
@@ -719,13 +777,12 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         label_attribute: Text,
         label_id_dict: Dict[Text, int],
         training: bool = True,
-    ):
+    ) -> None:
         label_ids = []
         if training and self.component_config[INTENT_CLASSIFICATION]:
             for example in training_data:
                 if example.get(label_attribute):
                     label_ids.append(label_id_dict[example.get(label_attribute)])
-
             # explicitly add last dimension to label_ids
             # to track correctly dynamic sequences
             model_data.add_features(
@@ -781,7 +838,6 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         label_attribute = (
             INTENT if self.component_config[INTENT_CLASSIFICATION] else None
         )
-
         model_data = self._create_model_data(
             training_data.nlu_examples,
             label_id_index_mapping,
@@ -796,12 +852,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
     def _check_enough_labels(model_data: RasaModelData) -> bool:
         return len(np.unique(model_data.get(LABEL_KEY, LABEL_SUB_KEY))) >= 2
 
-    def train(
-        self,
-        training_data: TrainingData,
-        config: Optional[RasaNLUModelConfig] = None,
-        **kwargs: Any,
-    ) -> None:
+    def train(self, training_data: TrainingData) -> Resource:
         """Train the embedding intent classifier on a data set."""
         model_data = self.preprocess_train_data(training_data)
         if model_data.is_empty():
@@ -809,7 +860,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                 f"Cannot train '{self.__class__.__name__}'. No data was provided. "
                 f"Skipping training of the classifier."
             )
-            return
+            return self._resource
+
+        if not self.model and self.finetune_mode:
+            raise rasa.shared.exceptions.InvalidParameterException(
+                f"{self.__class__.__name__} was instantiated "
+                f"with `model=None` and `finetune_mode=True`. "
+                f"This is not a valid combination as the component "
+                f"needs an already instantiated and trained model "
+                f"to continue training in finetune mode."
+            )
 
         if self.component_config.get(INTENT_CLASSIFICATION):
             if not self._check_enough_labels(model_data):
@@ -818,7 +878,7 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
                     f"Need at least 2 different intent classes. "
                     f"Skipping training of classifier."
                 )
-                return
+                return self._resource
         if self.component_config.get(ENTITY_RECOGNITION):
             self.check_correct_entity_annotations(training_data)
 
@@ -828,18 +888,53 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         if not self.finetune_mode:
             # No pre-trained model to load from. Create a new instance of the model.
             self.model = self._instantiate_model_class(model_data)
+            self.model.compile(
+                optimizer=tf.keras.optimizers.Adam(self.component_config[LEARNING_RATE])
+            )
+        else:
+            if self.model is None:
+                raise ModelNotFound("Model could not be found. ")
 
-        self.model.fit(
+            self.model.adjust_for_incremental_training(
+                data_example=self._data_example,
+                new_sparse_feature_sizes=model_data.get_sparse_feature_sizes(),
+                old_sparse_feature_sizes=self._sparse_feature_sizes,
+            )
+        self._sparse_feature_sizes = model_data.get_sparse_feature_sizes()
+
+        data_generator, validation_data_generator = train_utils.create_data_generators(
             model_data,
-            self.component_config[EPOCHS],
             self.component_config[BATCH_SIZES],
-            self.component_config[EVAL_NUM_EXAMPLES],
-            self.component_config[EVAL_NUM_EPOCHS],
+            self.component_config[EPOCHS],
             self.component_config[BATCH_STRATEGY],
+            self.component_config[EVAL_NUM_EXAMPLES],
+            self.component_config[RANDOM_SEED],
+        )
+        callbacks = train_utils.create_common_callbacks(
+            self.component_config[EPOCHS],
+            self.component_config[TENSORBOARD_LOG_DIR],
+            self.component_config[TENSORBOARD_LOG_LEVEL],
+            self.tmp_checkpoint_dir,
         )
 
+        self.model.fit(
+            data_generator,
+            epochs=self.component_config[EPOCHS],
+            validation_data=validation_data_generator,
+            validation_freq=self.component_config[EVAL_NUM_EPOCHS],
+            callbacks=callbacks,
+            verbose=False,
+            shuffle=False,  # we use custom shuffle inside data generator
+        )
+
+        self.persist()
+
+        return self._resource
+
     # process helpers
-    def _predict(self, message: Message) -> Optional[Dict[Text, tf.Tensor]]:
+    def _predict(
+        self, message: Message
+    ) -> Optional[Dict[Text, Union[tf.Tensor, Dict[Text, tf.Tensor]]]]:
         if self.model is None:
             logger.debug(
                 f"There is no trained model for '{self.__class__.__name__}': The "
@@ -850,65 +945,50 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         # create session data from message and convert it into a batch of 1
         model_data = self._create_model_data([message], training=False)
-
-        return self.model.predict(model_data)
+        if model_data.is_empty():
+            return None
+        return self.model.run_inference(model_data)
 
     def _predict_label(
         self, predict_out: Optional[Dict[Text, tf.Tensor]]
     ) -> Tuple[Dict[Text, Any], List[Dict[Text, Any]]]:
         """Predicts the intent of the provided message."""
-
-        label = {"name": None, "id": None, "confidence": 0.0}
-        label_ranking = []
+        label: Dict[Text, Any] = {"name": None, "confidence": 0.0}
+        label_ranking: List[Dict[Text, Any]] = []
 
         if predict_out is None:
             return label, label_ranking
 
-        message_sim = predict_out["i_scores"].numpy()
-
+        message_sim = predict_out["i_scores"]
         message_sim = message_sim.flatten()  # sim is a matrix
 
-        label_ids = message_sim.argsort()[::-1]
-
-        if (
-            self.component_config[RANKING_LENGTH] > 0
-            and self.component_config[MODEL_CONFIDENCE] == SOFTMAX
-        ):
-            # TODO: This should be removed in 3.0 when softmax as
-            #  model confidence and normalization is completely deprecated.
-            message_sim = train_utils.normalize(
-                message_sim, self.component_config[RANKING_LENGTH]
-            )
-
-        message_sim[::-1].sort()
-        message_sim = message_sim.tolist()
-
         # if X contains all zeros do not predict some label
-        if label_ids.size > 0:
-            label = {
-                "id": hash(self.index_label_id_mapping[label_ids[0]]),
-                "name": self.index_label_id_mapping[label_ids[0]],
-                "confidence": message_sim[0],
-            }
+        if message_sim.size == 0:
+            return label, label_ranking
 
-            if (
-                self.component_config[RANKING_LENGTH]
-                and 0 < self.component_config[RANKING_LENGTH] < LABEL_RANKING_LENGTH
-            ):
-                output_length = self.component_config[RANKING_LENGTH]
-            else:
-                output_length = LABEL_RANKING_LENGTH
+        # rank the confidences
+        ranking_length = self.component_config[RANKING_LENGTH]
+        renormalize = (
+            self.component_config[RENORMALIZE_CONFIDENCES]
+            and self.component_config[MODEL_CONFIDENCE] == SOFTMAX
+        )
+        ranked_label_indices, message_sim = train_utils.rank_and_mask(
+            message_sim, ranking_length=ranking_length, renormalize=renormalize
+        )
 
-            ranking = list(zip(list(label_ids), message_sim))
-            ranking = ranking[:output_length]
-            label_ranking = [
-                {
-                    "id": hash(self.index_label_id_mapping[label_idx]),
-                    "name": self.index_label_id_mapping[label_idx],
-                    "confidence": score,
-                }
-                for label_idx, score in ranking
-            ]
+        # construct the label and ranking
+        casted_message_sim: List[float] = message_sim.tolist()  # np.float to float
+        top_label_idx = ranked_label_indices[0]
+        label = {
+            "name": self.index_label_id_mapping[top_label_idx],
+            "confidence": casted_message_sim[top_label_idx],
+        }
+
+        ranking = [(idx, casted_message_sim[idx]) for idx in ranked_label_indices]
+        label_ranking = [
+            {"name": self.index_label_id_mapping[label_idx], "confidence": score}
+            for label_idx, score in ranking
+        ]
 
         return label, label_ranking
 
@@ -935,130 +1015,162 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
 
         return entities
 
-    def process(self, message: Message, **kwargs: Any) -> None:
+    def process(self, messages: List[Message]) -> List[Message]:
         """Augments the message with intents, entities, and diagnostic data."""
-        out = self._predict(message)
+        for message in messages:
+            out = self._predict(message)
 
-        if self.component_config[INTENT_CLASSIFICATION]:
-            label, label_ranking = self._predict_label(out)
+            if self.component_config[INTENT_CLASSIFICATION]:
+                label, label_ranking = self._predict_label(out)
 
-            message.set(INTENT, label, add_to_output=True)
-            message.set("intent_ranking", label_ranking, add_to_output=True)
+                message.set(INTENT, label, add_to_output=True)
+                message.set("intent_ranking", label_ranking, add_to_output=True)
 
-        if self.component_config[ENTITY_RECOGNITION]:
-            entities = self._predict_entities(out, message)
+            if self.component_config[ENTITY_RECOGNITION]:
+                entities = self._predict_entities(out, message)
 
-            message.set(ENTITIES, entities, add_to_output=True)
+                message.set(ENTITIES, entities, add_to_output=True)
 
-        if out and DIAGNOSTIC_DATA in out:
-            message.add_diagnostic_data(
-                self.unique_name,
-                rasa.utils.tensorflow.numpy.values_to_numpy(out.get(DIAGNOSTIC_DATA)),
-            )
+            if out and self._execution_context.should_add_diagnostic_data:
+                message.add_diagnostic_data(
+                    self._execution_context.node_name, out.get(DIAGNOSTIC_DATA)
+                )
 
-    def persist(self, file_name: Text, model_dir: Text) -> Dict[Text, Any]:
-        """Persist this model into the passed directory.
+        return messages
 
-        Return the metadata necessary to load the model again.
-        """
+    def persist(self) -> None:
+        """Persist this model into the passed directory."""
         if self.model is None:
-            return {"file": None}
+            return None
 
-        model_dir = Path(model_dir)
-        tf_model_file = model_dir / f"{file_name}.tf_model"
+        with self._model_storage.write_to(self._resource) as model_path:
+            file_name = self.__class__.__name__
+            tf_model_file = model_path / f"{file_name}.tf_model"
 
-        rasa.shared.utils.io.create_directory_for_file(tf_model_file)
+            rasa.shared.utils.io.create_directory_for_file(tf_model_file)
 
-        if self.model.checkpoint_model:
-            self.model.copy_best(str(tf_model_file))
-        else:
+            if self.component_config[CHECKPOINT_MODEL] and self.tmp_checkpoint_dir:
+                self.model.load_weights(self.tmp_checkpoint_dir / "checkpoint.tf_model")
+                # Save an empty file to flag that this model has been
+                # produced using checkpointing
+                checkpoint_marker = model_path / f"{file_name}.from_checkpoint.pkl"
+                checkpoint_marker.touch()
+
             self.model.save(str(tf_model_file))
 
-        io_utils.pickle_dump(
-            model_dir / f"{file_name}.data_example.pkl", self._data_example
-        )
-        io_utils.pickle_dump(
-            model_dir / f"{file_name}.label_data.pkl", dict(self._label_data.data)
-        )
-        io_utils.json_pickle(
-            model_dir / f"{file_name}.index_label_id_mapping.json",
-            self.index_label_id_mapping,
-        )
+            io_utils.pickle_dump(
+                model_path / f"{file_name}.data_example.pkl", self._data_example
+            )
+            io_utils.pickle_dump(
+                model_path / f"{file_name}.sparse_feature_sizes.pkl",
+                self._sparse_feature_sizes,
+            )
+            io_utils.pickle_dump(
+                model_path / f"{file_name}.label_data.pkl",
+                dict(self._label_data.data) if self._label_data is not None else {},
+            )
+            io_utils.json_pickle(
+                model_path / f"{file_name}.index_label_id_mapping.json",
+                self.index_label_id_mapping,
+            )
 
-        entity_tag_specs = (
-            [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
-            if self._entity_tag_specs
-            else []
-        )
-        rasa.shared.utils.io.dump_obj_as_json_to_file(
-            model_dir / f"{file_name}.entity_tag_specs.json", entity_tag_specs
-        )
-
-        return {"file": file_name}
+            entity_tag_specs = (
+                [tag_spec._asdict() for tag_spec in self._entity_tag_specs]
+                if self._entity_tag_specs
+                else []
+            )
+            rasa.shared.utils.io.dump_obj_as_json_to_file(
+                model_path / f"{file_name}.entity_tag_specs.json", entity_tag_specs
+            )
 
     @classmethod
     def load(
         cls,
-        meta: Dict[Text, Any],
-        model_dir: Text = None,
-        model_metadata: Metadata = None,
-        cached_component: Optional["DIETClassifier"] = None,
-        should_finetune: bool = False,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
         **kwargs: Any,
+    ) -> DIETClassifier:
+        """Loads a policy from the storage (see parent class for full docstring)."""
+        try:
+            with model_storage.read_from(resource) as model_path:
+                return cls._load(
+                    model_path, config, model_storage, resource, execution_context
+                )
+        except ValueError:
+            logger.debug(
+                f"Failed to load {cls.__class__.__name__} from model storage. Resource "
+                f"'{resource.name}' doesn't exist."
+            )
+            return cls(config, model_storage, resource, execution_context)
+
+    @classmethod
+    def _load(
+        cls,
+        model_path: Path,
+        config: Dict[Text, Any],
+        model_storage: ModelStorage,
+        resource: Resource,
+        execution_context: ExecutionContext,
     ) -> "DIETClassifier":
         """Loads the trained model from the provided directory."""
-        if not model_dir or not meta.get("file"):
-            logger.debug(
-                f"Failed to load model for '{cls.__name__}'. "
-                f"Maybe you did not provide enough training data and no model was "
-                f"trained or the path '{os.path.abspath(model_dir)}' doesn't exist?"
-            )
-            return cls(component_config=meta)
-
         (
             index_label_id_mapping,
             entity_tag_specs,
             label_data,
-            meta,
             data_example,
-        ) = cls._load_from_files(meta, model_dir)
+            sparse_feature_sizes,
+        ) = cls._load_from_files(model_path)
 
-        meta = train_utils.override_defaults(cls.defaults, meta)
-        meta = train_utils.update_confidence_type(meta)
-        meta = train_utils.update_similarity_type(meta)
-        meta = train_utils.update_deprecated_loss_type(meta)
+        config = train_utils.update_confidence_type(config)
+        config = train_utils.update_similarity_type(config)
 
         model = cls._load_model(
             entity_tag_specs,
             label_data,
-            meta,
+            config,
             data_example,
-            model_dir,
-            finetune_mode=should_finetune,
+            model_path,
+            finetune_mode=execution_context.is_finetuning,
         )
 
         return cls(
-            component_config=meta,
+            config=config,
+            model_storage=model_storage,
+            resource=resource,
+            execution_context=execution_context,
             index_label_id_mapping=index_label_id_mapping,
             entity_tag_specs=entity_tag_specs,
             model=model,
-            finetune_mode=should_finetune,
+            sparse_feature_sizes=sparse_feature_sizes,
         )
 
     @classmethod
-    def _load_from_files(cls, meta: Dict[Text, Any], model_dir: Text):
-        file_name = meta.get("file")
+    def _load_from_files(
+        cls, model_path: Path
+    ) -> Tuple[
+        Dict[int, Text],
+        List[EntityTagSpec],
+        RasaModelData,
+        Dict[Text, Dict[Text, List[FeatureArray]]],
+        Dict[Text, Dict[Text, List[int]]],
+    ]:
+        file_name = cls.__name__
 
-        model_dir = Path(model_dir)
-
-        data_example = io_utils.pickle_load(model_dir / f"{file_name}.data_example.pkl")
-        label_data = io_utils.pickle_load(model_dir / f"{file_name}.label_data.pkl")
+        data_example = io_utils.pickle_load(
+            model_path / f"{file_name}.data_example.pkl"
+        )
+        label_data = io_utils.pickle_load(model_path / f"{file_name}.label_data.pkl")
         label_data = RasaModelData(data=label_data)
+        sparse_feature_sizes = io_utils.pickle_load(
+            model_path / f"{file_name}.sparse_feature_sizes.pkl"
+        )
         index_label_id_mapping = io_utils.json_unpickle(
-            model_dir / f"{file_name}.index_label_id_mapping.json"
+            model_path / f"{file_name}.index_label_id_mapping.json"
         )
         entity_tag_specs = rasa.shared.utils.io.read_json_file(
-            model_dir / f"{file_name}.entity_tag_specs.json"
+            model_path / f"{file_name}.entity_tag_specs.json"
         )
         entity_tag_specs = [
             EntityTagSpec(
@@ -1083,8 +1195,8 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             index_label_id_mapping,
             entity_tag_specs,
             label_data,
-            meta,
             data_example,
+            sparse_feature_sizes,
         )
 
     @classmethod
@@ -1092,16 +1204,16 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         cls,
         entity_tag_specs: List[EntityTagSpec],
         label_data: RasaModelData,
-        meta: Dict[Text, Any],
+        config: Dict[Text, Any],
         data_example: Dict[Text, Dict[Text, List[FeatureArray]]],
-        model_dir: Text,
+        model_path: Path,
         finetune_mode: bool = False,
     ) -> "RasaModel":
-        file_name = meta.get("file")
-        tf_model_file = os.path.join(model_dir, file_name + ".tf_model")
+        file_name = cls.__name__
+        tf_model_file = model_path / f"{file_name}.tf_model"
 
-        label_key = LABEL_KEY if meta[INTENT_CLASSIFICATION] else None
-        label_sub_key = LABEL_SUB_KEY if meta[INTENT_CLASSIFICATION] else None
+        label_key = LABEL_KEY if config[INTENT_CLASSIFICATION] else None
+        label_sub_key = LABEL_SUB_KEY if config[INTENT_CLASSIFICATION] else None
 
         model_data_example = RasaModelData(
             label_key=label_key, label_sub_key=label_sub_key, data=data_example
@@ -1112,23 +1224,9 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
             model_data_example,
             label_data,
             entity_tag_specs,
-            meta,
+            config,
             finetune_mode=finetune_mode,
         )
-
-        if not finetune_mode:
-
-            # build the graph for prediction
-            predict_data_example = RasaModelData(
-                label_key=label_key,
-                data={
-                    feature_name: features
-                    for feature_name, features in model_data_example.items()
-                    if TEXT in feature_name
-                },
-            )
-
-            model.build_for_predict(predict_data_example)
 
         return model
 
@@ -1139,22 +1237,31 @@ class DIETClassifier(IntentClassifier, EntityExtractor):
         model_data_example: RasaModelData,
         label_data: RasaModelData,
         entity_tag_specs: List[EntityTagSpec],
-        meta: Dict[Text, Any],
+        config: Dict[Text, Any],
         finetune_mode: bool,
     ) -> "RasaModel":
+
+        predict_data_example = RasaModelData(
+            label_key=model_data_example.label_key,
+            data={
+                feature_name: features
+                for feature_name, features in model_data_example.items()
+                if TEXT in feature_name
+            },
+        )
 
         return cls.model_class().load(
             tf_model_file,
             model_data_example,
+            predict_data_example,
             data_signature=model_data_example.get_signature(),
             label_data=label_data,
             entity_tag_specs=entity_tag_specs,
-            config=copy.deepcopy(meta),
+            config=copy.deepcopy(config),
             finetune_mode=finetune_mode,
         )
 
     def _instantiate_model_class(self, model_data: RasaModelData) -> "RasaModel":
-
         return self.model_class()(
             data_signature=model_data.get_signature(),
             label_data=self._label_data,
@@ -1183,7 +1290,6 @@ class DIET(TransformerRasaModel):
         }
 
         # tf training
-        self.optimizer = tf.keras.optimizers.Adam(config[LEARNING_RATE])
         self._create_metrics()
         self._update_metrics_to_log()
 
@@ -1317,68 +1423,88 @@ class DIET(TransformerRasaModel):
             logger.debug(f"  {metric} ({name})")
 
     def _prepare_layers(self) -> None:
+        # For user text, prepare layers that combine different feature types, embed
+        # everything using a transformer and optionally also do masked language
+        # modeling.
         self.text_name = TEXT
-        self._prepare_sequence_layers(self.text_name)
+        self._tf_layers[
+            f"sequence_layer.{self.text_name}"
+        ] = rasa_layers.RasaSequenceLayer(
+            self.text_name, self.data_signature[self.text_name], self.config
+        )
         if self.config[MASKED_LM]:
-            self._prepare_mask_lm_layers(self.text_name)
+            self._prepare_mask_lm_loss(self.text_name)
+
+        # Intent labels are treated similarly to user text but without the transformer,
+        # without masked language modelling, and with no dropout applied to the
+        # individual features, only to the overall label embedding after all label
+        # features have been combined.
         if self.config[INTENT_CLASSIFICATION]:
             self.label_name = TEXT if self.config[SHARE_HIDDEN_LAYERS] else LABEL
-            self._prepare_input_layers(self.label_name)
-            self._prepare_label_classification_layers()
+
+            # disable input dropout applied to sparse and dense label features
+            label_config = self.config.copy()
+            label_config.update(
+                {SPARSE_INPUT_DROPOUT: False, DENSE_INPUT_DROPOUT: False}
+            )
+
+            self._tf_layers[
+                f"feature_combining_layer.{self.label_name}"
+            ] = rasa_layers.RasaFeatureCombiningLayer(
+                self.label_name, self.label_signature[self.label_name], label_config
+            )
+
+            self._prepare_ffnn_layer(
+                self.label_name,
+                self.config[HIDDEN_LAYERS_SIZES][self.label_name],
+                self.config[DROP_RATE],
+            )
+
+            self._prepare_label_classification_layers(predictor_attribute=TEXT)
+
         if self.config[ENTITY_RECOGNITION]:
             self._prepare_entity_recognition_layers()
 
-    def _prepare_mask_lm_layers(self, name: Text) -> None:
-        self._tf_layers[f"{name}_input_mask"] = layers.InputMask()
-
+    def _prepare_mask_lm_loss(self, name: Text) -> None:
+        # for embedding predicted tokens at masked positions
         self._prepare_embed_layers(f"{name}_lm_mask")
+
+        # for embedding the true tokens that got masked
         self._prepare_embed_layers(f"{name}_golden_token")
 
         # mask loss is additional loss
         # set scaling to False, so that it doesn't overpower other losses
         self._prepare_dot_product_loss(f"{name}_mask", scale_loss=False)
 
-    def _prepare_label_classification_layers(self) -> None:
-        self._prepare_embed_layers(TEXT)
-        self._prepare_embed_layers(LABEL)
-
-        self._prepare_dot_product_loss(LABEL, self.config[SCALE_LOSS])
-
     def _create_bow(
         self,
         sequence_features: List[Union[tf.Tensor, tf.SparseTensor]],
         sentence_features: List[Union[tf.Tensor, tf.SparseTensor]],
-        sequence_mask: tf.Tensor,
-        text_mask: tf.Tensor,
+        sequence_feature_lengths: tf.Tensor,
         name: Text,
-        sparse_dropout: bool = False,
-        dense_dropout: bool = False,
     ) -> tf.Tensor:
 
-        x = self._combine_sequence_sentence_features(
-            sequence_features,
-            sentence_features,
-            sequence_mask,
-            text_mask,
-            name,
-            sparse_dropout,
-            dense_dropout,
+        x, _ = self._tf_layers[f"feature_combining_layer.{name}"](
+            (sequence_features, sentence_features, sequence_feature_lengths),
+            training=self._training,
         )
-        x = tf.reduce_sum(x, axis=1)  # convert to bag-of-words
+
+        # convert to bag-of-words by summing along the sequence dimension
+        x = tf.reduce_sum(x, axis=1)
+
         return self._tf_layers[f"ffnn.{name}"](x, self._training)
 
     def _create_all_labels(self) -> Tuple[tf.Tensor, tf.Tensor]:
         all_label_ids = self.tf_label_data[LABEL_KEY][LABEL_SUB_KEY][0]
 
-        mask_sequence_label = self._get_mask_for(
-            self.tf_label_data, LABEL, SEQUENCE_LENGTH
+        sequence_feature_lengths = self._get_sequence_feature_lengths(
+            self.tf_label_data, LABEL
         )
 
         x = self._create_bow(
             self.tf_label_data[LABEL][SEQUENCE],
             self.tf_label_data[LABEL][SENTENCE],
-            mask_sequence_label,
-            mask_sequence_label,
+            sequence_feature_lengths,
             self.label_name,
         )
         all_labels_embed = self._tf_layers[f"embed.{LABEL}"](x)
@@ -1390,27 +1516,41 @@ class DIET(TransformerRasaModel):
         outputs: tf.Tensor,
         inputs: tf.Tensor,
         seq_ids: tf.Tensor,
-        lm_mask_bool: tf.Tensor,
+        mlm_mask_boolean: tf.Tensor,
         name: Text,
     ) -> tf.Tensor:
         # make sure there is at least one element in the mask
-        lm_mask_bool = tf.cond(
-            tf.reduce_any(lm_mask_bool),
-            lambda: lm_mask_bool,
-            lambda: tf.scatter_nd([[0, 0, 0]], [True], tf.shape(lm_mask_bool)),
+        mlm_mask_boolean = tf.cond(
+            tf.reduce_any(mlm_mask_boolean),
+            lambda: mlm_mask_boolean,
+            lambda: tf.scatter_nd([[0, 0, 0]], [True], tf.shape(mlm_mask_boolean)),
         )
 
-        lm_mask_bool = tf.squeeze(lm_mask_bool, -1)
-        # pick elements that were masked
-        outputs = tf.boolean_mask(outputs, lm_mask_bool)
-        inputs = tf.boolean_mask(inputs, lm_mask_bool)
-        ids = tf.boolean_mask(seq_ids, lm_mask_bool)
+        mlm_mask_boolean = tf.squeeze(mlm_mask_boolean, -1)
 
-        outputs_embed = self._tf_layers[f"embed.{name}_lm_mask"](outputs)
-        inputs_embed = self._tf_layers[f"embed.{name}_golden_token"](inputs)
+        # Pick elements that were masked, throwing away the batch & sequence dimension
+        # and effectively switching from shape (batch_size, sequence_length, units) to
+        # (num_masked_elements, units).
+        outputs = tf.boolean_mask(outputs, mlm_mask_boolean)
+        inputs = tf.boolean_mask(inputs, mlm_mask_boolean)
+        ids = tf.boolean_mask(seq_ids, mlm_mask_boolean)
 
+        tokens_predicted_embed = self._tf_layers[f"embed.{name}_lm_mask"](outputs)
+        tokens_true_embed = self._tf_layers[f"embed.{name}_golden_token"](inputs)
+
+        # To limit the otherwise computationally expensive loss calculation, we
+        # constrain the label space in MLM (i.e. token space) to only those tokens that
+        # were masked in this batch. Hence the reduced list of token embeddings
+        # (tokens_true_embed) and the reduced list of labels (ids) are passed as
+        # all_labels_embed and all_labels, respectively. In the future, we could be less
+        # restrictive and construct a slightly bigger label space which could include
+        # tokens not masked in the current batch too.
         return self._tf_layers[f"loss.{name}_mask"](
-            outputs_embed, inputs_embed, ids, inputs_embed, ids
+            inputs_embed=tokens_predicted_embed,
+            labels_embed=tokens_true_embed,
+            labels=ids,
+            all_labels_embed=tokens_true_embed,
+            all_labels=ids,
         )
 
     def _calculate_label_loss(
@@ -1438,36 +1578,41 @@ class DIET(TransformerRasaModel):
         """
         tf_batch_data = self.batch_to_model_data_format(batch_in, self.data_signature)
 
-        batch_dim = self._get_batch_dim(tf_batch_data[TEXT])
-        mask_sequence_text = self._get_mask_for(tf_batch_data, TEXT, SEQUENCE_LENGTH)
-        sequence_lengths = self._get_sequence_lengths(
-            tf_batch_data, TEXT, SEQUENCE_LENGTH, batch_dim
+        sequence_feature_lengths = self._get_sequence_feature_lengths(
+            tf_batch_data, TEXT
         )
-        mask_text = self._compute_mask(sequence_lengths)
 
         (
             text_transformed,
             text_in,
+            mask_combined_sequence_sentence,
             text_seq_ids,
-            lm_mask_bool_text,
+            mlm_mask_boolean_text,
             _,
-        ) = self._create_sequence(
-            tf_batch_data[TEXT][SEQUENCE],
-            tf_batch_data[TEXT][SENTENCE],
-            mask_sequence_text,
-            mask_text,
-            self.text_name,
-            sparse_dropout=self.config[SPARSE_INPUT_DROPOUT],
-            dense_dropout=self.config[DENSE_INPUT_DROPOUT],
-            masked_lm_loss=self.config[MASKED_LM],
-            sequence_ids=True,
+        ) = self._tf_layers[f"sequence_layer.{self.text_name}"](
+            (
+                tf_batch_data[TEXT][SEQUENCE],
+                tf_batch_data[TEXT][SENTENCE],
+                sequence_feature_lengths,
+            ),
+            training=self._training,
         )
 
         losses = []
 
+        # Lengths of sequences in case of sentence-level features are always 1, but they
+        # can effectively be 0 if sentence-level features aren't present.
+        sentence_feature_lengths = self._get_sentence_feature_lengths(
+            tf_batch_data, TEXT
+        )
+
+        combined_sequence_sentence_feature_lengths = (
+            sequence_feature_lengths + sentence_feature_lengths
+        )
+
         if self.config[MASKED_LM]:
             loss, acc = self._mask_loss(
-                text_transformed, text_in, text_seq_ids, lm_mask_bool_text, TEXT
+                text_transformed, text_in, text_seq_ids, mlm_mask_boolean_text, TEXT
             )
             self.mask_loss.update_state(loss)
             self.mask_acc.update_state(acc)
@@ -1475,38 +1620,44 @@ class DIET(TransformerRasaModel):
 
         if self.config[INTENT_CLASSIFICATION]:
             loss = self._batch_loss_intent(
-                sequence_lengths, mask_text, text_transformed, tf_batch_data
+                combined_sequence_sentence_feature_lengths,
+                text_transformed,
+                tf_batch_data,
             )
             losses.append(loss)
 
         if self.config[ENTITY_RECOGNITION]:
             losses += self._batch_loss_entities(
-                mask_text, sequence_lengths, text_transformed, tf_batch_data
+                mask_combined_sequence_sentence,
+                sequence_feature_lengths,
+                text_transformed,
+                tf_batch_data,
             )
 
         return tf.math.add_n(losses)
 
     def _batch_loss_intent(
         self,
-        sequence_lengths: tf.Tensor,
-        mask_text: tf.Tensor,
+        combined_sequence_sentence_feature_lengths_text: tf.Tensor,
         text_transformed: tf.Tensor,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
     ) -> tf.Tensor:
         # get sentence features vector for intent classification
-        sentence_vector = self._last_token(text_transformed, sequence_lengths)
+        sentence_vector = self._last_token(
+            text_transformed, combined_sequence_sentence_feature_lengths_text
+        )
 
-        mask_sequence_label = self._get_mask_for(tf_batch_data, LABEL, SEQUENCE_LENGTH)
+        sequence_feature_lengths_label = self._get_sequence_feature_lengths(
+            tf_batch_data, LABEL
+        )
 
         label_ids = tf_batch_data[LABEL_KEY][LABEL_SUB_KEY][0]
         label = self._create_bow(
             tf_batch_data[LABEL][SEQUENCE],
             tf_batch_data[LABEL][SENTENCE],
-            mask_sequence_label,
-            mask_text,
+            sequence_feature_lengths_label,
             self.label_name,
         )
-
         loss, acc = self._calculate_label_loss(sentence_vector, label, label_ids)
 
         self._update_label_metrics(loss, acc)
@@ -1520,14 +1671,12 @@ class DIET(TransformerRasaModel):
 
     def _batch_loss_entities(
         self,
-        mask_text: tf.Tensor,
-        sequence_lengths: tf.Tensor,
+        mask_combined_sequence_sentence: tf.Tensor,
+        sequence_feature_lengths: tf.Tensor,
         text_transformed: tf.Tensor,
         tf_batch_data: Dict[Text, Dict[Text, List[tf.Tensor]]],
     ) -> List[tf.Tensor]:
         losses = []
-
-        sequence_lengths -= 1  # remove sentence features
 
         entity_tags = None
 
@@ -1543,8 +1692,8 @@ class DIET(TransformerRasaModel):
             loss, f1, _logits = self._calculate_entity_loss(
                 text_transformed,
                 tag_ids,
-                mask_text,
-                sequence_lengths,
+                mask_combined_sequence_sentence,
+                sequence_feature_lengths,
                 tag_spec.tag_name,
                 entity_tags,
             )
@@ -1562,7 +1711,9 @@ class DIET(TransformerRasaModel):
 
         return losses
 
-    def _update_entity_metrics(self, loss: tf.Tensor, f1: tf.Tensor, tag_name: Text):
+    def _update_entity_metrics(
+        self, loss: tf.Tensor, f1: tf.Tensor, tag_name: Text
+    ) -> None:
         if tag_name == ENTITY_ATTRIBUTE_TYPE:
             self.entity_loss.update_state(loss)
             self.entity_f1.update_state(f1)
@@ -1593,42 +1744,47 @@ class DIET(TransformerRasaModel):
             batch_in, self.predict_data_signature
         )
 
-        mask_sequence_text = self._get_mask_for(tf_batch_data, TEXT, SEQUENCE_LENGTH)
-        sequence_lengths = self._get_sequence_lengths(
-            tf_batch_data, TEXT, SEQUENCE_LENGTH, batch_dim=1
+        sequence_feature_lengths = self._get_sequence_feature_lengths(
+            tf_batch_data, TEXT
+        )
+        sentence_feature_lengths = self._get_sentence_feature_lengths(
+            tf_batch_data, TEXT
         )
 
-        mask = self._compute_mask(sequence_lengths)
-
-        text_transformed, _, _, _, attention_weights = self._create_sequence(
-            tf_batch_data[TEXT][SEQUENCE],
-            tf_batch_data[TEXT][SENTENCE],
-            mask_sequence_text,
-            mask,
-            self.text_name,
+        text_transformed, _, _, _, _, attention_weights = self._tf_layers[
+            f"sequence_layer.{self.text_name}"
+        ](
+            (
+                tf_batch_data[TEXT][SEQUENCE],
+                tf_batch_data[TEXT][SENTENCE],
+                sequence_feature_lengths,
+            ),
+            training=self._training,
         )
-
-        predictions: Dict[Text, tf.Tensor] = {}
-
-        predictions[DIAGNOSTIC_DATA] = {
-            "attention_weights": attention_weights,
-            "text_transformed": text_transformed,
+        predictions = {
+            DIAGNOSTIC_DATA: {
+                "attention_weights": attention_weights,
+                "text_transformed": text_transformed,
+            }
         }
 
         if self.config[INTENT_CLASSIFICATION]:
             predictions.update(
-                self._batch_predict_intents(sequence_lengths, text_transformed)
+                self._batch_predict_intents(
+                    sequence_feature_lengths + sentence_feature_lengths,
+                    text_transformed,
+                )
             )
 
         if self.config[ENTITY_RECOGNITION]:
             predictions.update(
-                self._batch_predict_entities(sequence_lengths, text_transformed)
+                self._batch_predict_entities(sequence_feature_lengths, text_transformed)
             )
 
         return predictions
 
     def _batch_predict_entities(
-        self, sequence_lengths: tf.Tensor, text_transformed: tf.Tensor
+        self, sequence_feature_lengths: tf.Tensor, text_transformed: tf.Tensor
     ) -> Dict[Text, tf.Tensor]:
         predictions: Dict[Text, tf.Tensor] = {}
 
@@ -1648,7 +1804,7 @@ class DIET(TransformerRasaModel):
 
             _logits = self._tf_layers[f"embed.{name}.logits"](_input)
             pred_ids, confidences = self._tf_layers[f"crf.{name}"](
-                _logits, sequence_lengths - 1
+                _logits, sequence_feature_lengths
             )
 
             predictions[f"e_{name}_ids"] = pred_ids
@@ -1664,7 +1820,9 @@ class DIET(TransformerRasaModel):
         return predictions
 
     def _batch_predict_intents(
-        self, sequence_lengths: tf.Tensor, text_transformed: tf.Tensor
+        self,
+        combined_sequence_sentence_feature_lengths: tf.Tensor,
+        text_transformed: tf.Tensor,
     ) -> Dict[Text, tf.Tensor]:
 
         if self.all_labels_embed is None:
@@ -1674,12 +1832,14 @@ class DIET(TransformerRasaModel):
             )
 
         # get sentence feature vector for intent classification
-        sentence_vector = self._last_token(text_transformed, sequence_lengths)
+        sentence_vector = self._last_token(
+            text_transformed, combined_sequence_sentence_feature_lengths
+        )
         sentence_vector_embed = self._tf_layers[f"embed.{TEXT}"](sentence_vector)
 
         _, scores = self._tf_layers[
             f"loss.{LABEL}"
-        ].similarity_confidence_from_embeddings(
+        ].get_similarities_and_confidences_from_embeddings(
             sentence_vector_embed[:, tf.newaxis, :],
             self.all_labels_embed[tf.newaxis, :, :],
         )

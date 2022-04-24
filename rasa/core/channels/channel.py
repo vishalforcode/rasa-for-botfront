@@ -1,6 +1,7 @@
 import json
 import logging
 import uuid
+import jwt
 from sanic import Sanic, Blueprint
 from sanic.request import Request
 from typing import (
@@ -17,6 +18,7 @@ from typing import (
 
 from rasa.cli import utils as cli_utils
 from rasa.shared.constants import DOCS_BASE_URL, DEFAULT_SENDER_ID
+from rasa.core.constants import BEARER_TOKEN_PREFIX
 from rasa.shared.exceptions import RasaException
 
 try:
@@ -81,8 +83,10 @@ class UserMessage:
 def register(
     input_channels: List["InputChannel"], app: Sanic, route: Optional[Text]
 ) -> None:
-    async def handler(*args, **kwargs):
-        await app.agent.handle_message(*args, **kwargs)
+    """Registers input channel blueprints with Sanic."""
+
+    async def handler(message: UserMessage) -> None:
+        await app.ctx.agent.handle_message(message)
 
     for channel in input_channels:
         if route:
@@ -91,10 +95,12 @@ def register(
             p = None
         app.blueprint(channel.blueprint(handler), url_prefix=p)
 
-    app.input_channels = input_channels
+    app.ctx.input_channels = input_channels
 
 
 class InputChannel:
+    """Input channel base class."""
+
     @classmethod
     def name(cls) -> Text:
         """Every input channel needs a name to identify it."""
@@ -157,11 +163,52 @@ class InputChannel:
         pass
 
 
+def decode_jwt(bearer_token: Text, jwt_key: Text, jwt_algorithm: Text) -> Dict:
+    """Decodes a Bearer Token using the specific JWT key and algorithm.
+
+    Args:
+        bearer_token: Encoded Bearer token
+        jwt_key: Public JWT key for decoding the Bearer token
+        jwt_algorithm: JWT algorithm used for decoding the Bearer token
+
+    Returns:
+        `Dict` containing the decoded payload if successful or an exception
+        if unsuccessful
+    """
+    authorization_header_value = bearer_token.replace(BEARER_TOKEN_PREFIX, "")
+    return jwt.decode(authorization_header_value, jwt_key, algorithms=jwt_algorithm)
+
+
+def decode_bearer_token(
+    bearer_token: Text, jwt_key: Text, jwt_algorithm: Text
+) -> Optional[Dict]:
+    """Decodes a Bearer Token using the specific JWT key and algorithm.
+
+    Args:
+        bearer_token: Encoded Bearer token
+        jwt_key: Public JWT key for decoding the Bearer token
+        jwt_algorithm: JWT algorithm used for decoding the Bearer token
+
+    Returns:
+        `Dict` containing the decoded payload if successful or `None` if unsuccessful
+    """
+    # noinspection PyBroadException
+    try:
+        return decode_jwt(bearer_token, jwt_key, jwt_algorithm)
+    except jwt.exceptions.InvalidSignatureError:
+        logger.error("JWT public key invalid.")
+    except Exception:
+        logger.exception("Failed to decode bearer token.")
+
+    return None
+
+
 class OutputChannel:
     """Output channel base class.
 
     Provides sane implementation of the send methods
-    for text only output channels."""
+    for text only output channels.
+    """
 
     @classmethod
     def name(cls) -> Text:
@@ -283,10 +330,12 @@ class CollectingOutputChannel(OutputChannel):
     (doesn't send them anywhere, just collects them)."""
 
     def __init__(self) -> None:
-        self.messages = []
+        """Initialise list to collect messages."""
+        self.messages: List[Dict[Text, Any]] = []
 
     @classmethod
     def name(cls) -> Text:
+        """Name of the channel."""
         return "collector"
 
     @staticmethod

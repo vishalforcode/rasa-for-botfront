@@ -5,12 +5,13 @@ import pytest
 from aioresponses import aioresponses
 
 from rasa.core.agent import Agent
+from rasa.shared.core.domain import Domain
 from rasa.utils.endpoints import ClientResponseError
 
 
-@pytest.mark.timeout(300)
-async def test_moodbot_example(unpacked_trained_moodbot_path: Text):
-    agent = Agent.load(unpacked_trained_moodbot_path)
+@pytest.mark.timeout(300, func_only=True)
+async def test_moodbot_example(trained_moodbot_path: Text):
+    agent = Agent.load(trained_moodbot_path)
 
     responses = await agent.handle_text("/greet")
     assert responses[0]["text"] == "Hey! How are you?"
@@ -21,16 +22,25 @@ async def test_moodbot_example(unpacked_trained_moodbot_path: Text):
     # (there is a 'I am on it' message in the middle we are not checking)
     assert len(responses) == 4
 
+    moodbot_domain = Domain.load("data/test_moodbot/domain.yml")
+    assert agent.domain.action_names_or_texts == moodbot_domain.action_names_or_texts
+    assert agent.domain.intents == moodbot_domain.intents
+    assert agent.domain.entities == moodbot_domain.entities
+    assert agent.domain.responses == moodbot_domain.responses
+    assert [s.name for s in agent.domain.slots] == [
+        s.name for s in moodbot_domain.slots
+    ]
 
-@pytest.mark.timeout(300)
+
+@pytest.mark.timeout(300, func_only=True)
 async def test_formbot_example(form_bot_agent: Agent):
     def response_for_slot(slot: Text) -> Dict[Text, Any]:
         if slot:
             form = "restaurant_form"
-            template = f"utter_ask_{slot}"
+            response = f"utter_ask_{slot}"
         else:
             form = None
-            template = "utter_submit"
+            response = "utter_submit"
 
         return {
             "events": [
@@ -42,7 +52,7 @@ async def test_formbot_example(form_bot_agent: Agent):
                     "value": slot,
                 },
             ],
-            "responses": [{"template": template}],
+            "responses": [{"response": response}],
         }
 
     async def mock_form_happy_path(

@@ -1,3 +1,4 @@
+from typing import Text
 from threading import Thread
 
 import pytest
@@ -21,7 +22,7 @@ from rasa.shared.utils.validation import KEY_TRAINING_DATA_FORMAT_VERSION
 @pytest.mark.parametrize(
     "file, schema",
     [
-        ("examples/moodbot/domain.yml", DOMAIN_SCHEMA_FILE),
+        ("data/test_moodbot/domain.yml", DOMAIN_SCHEMA_FILE),
         ("data/test_config/config_defaults.yml", CONFIG_SCHEMA_FILE),
         ("data/test_config/config_supervised_embeddings.yml", CONFIG_SCHEMA_FILE),
         ("data/test_config/config_crf_custom_features.yml", CONFIG_SCHEMA_FILE),
@@ -39,14 +40,48 @@ def test_validate_yaml_schema(file, schema):
         ("data/test_domains/wrong_response_format.yml", DOMAIN_SCHEMA_FILE),
         ("data/test_domains/wrong_custom_response_format.yml", DOMAIN_SCHEMA_FILE),
         ("data/test_domains/empty_response_format.yml", DOMAIN_SCHEMA_FILE),
-        ("data/test_config/example_config.yaml", CONFIG_SCHEMA_FILE),
     ],
 )
-def test_validate_yaml_schema_raise_exception(file, schema):
+def test_validate_yaml_schema_raise_exception(file: Text, schema: Text):
     with pytest.raises(YamlException):
         validation_utils.validate_yaml_schema(
             rasa.shared.utils.io.read_file(file), schema
         )
+
+
+def test_validate_yaml_schema_raise_exception_null_text():
+    domain = f"""
+    version: "{LATEST_TRAINING_DATA_FORMAT_VERSION}"
+    responses:
+      utter_ask_email:
+      - text: What is your email ID?
+      utter_ask_name:
+      - text: null
+    """
+    with pytest.raises(validation_utils.YamlValidationException) as e:
+        validation_utils.validate_yaml_schema(domain, DOMAIN_SCHEMA_FILE)
+
+    assert (
+        "Missing 'text' or 'custom' key in response or null 'text' value in response."
+        in str(e.value)
+    )
+
+
+def test_validate_yaml_schema_raise_exception_extra_hyphen_for_image():
+    domain = f"""
+        version: "{LATEST_TRAINING_DATA_FORMAT_VERSION}"
+        responses:
+          utter_cheer_up:
+          - image: https://i.imgur.com/nGF1K8f.jpg
+          - text: Here is something to cheer you up
+        """
+    with pytest.raises(validation_utils.YamlValidationException) as e:
+        validation_utils.validate_yaml_schema(domain, DOMAIN_SCHEMA_FILE)
+
+    assert (
+        "Missing 'text' or 'custom' key in response or null 'text' value in response."
+        in str(e.value)
+    )
 
 
 def test_example_training_data_is_valid():
@@ -190,8 +225,8 @@ def test_concurrent_schema_validation():
     successful_results = []
 
     def validate() -> None:
-        payload = """
-version: "2.0"
+        payload = f"""
+version: "{LATEST_TRAINING_DATA_FORMAT_VERSION}"
 nlu:
 - intent: greet
   examples: |

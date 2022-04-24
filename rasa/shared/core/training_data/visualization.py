@@ -1,13 +1,24 @@
 from collections import defaultdict, deque
 
 import random
-from typing import Any, Text, List, Dict, Optional, TYPE_CHECKING, Set
+from typing import (
+    Any,
+    Text,
+    List,
+    Deque,
+    Dict,
+    Optional,
+    Set,
+    TYPE_CHECKING,
+    Union,
+    cast,
+)
 
 import rasa.shared.utils.io
+from rasa.shared.constants import INTENT_MESSAGE_PREFIX
 from rasa.shared.core.constants import ACTION_LISTEN_NAME
 from rasa.shared.core.domain import Domain
 from rasa.shared.core.events import UserUttered, ActionExecuted, Event
-from rasa.shared.nlu.interpreter import NaturalLanguageInterpreter, RegexInterpreter
 from rasa.shared.core.generator import TrainingDataGenerator
 from rasa.shared.core.training_data.structures import StoryGraph, StoryStep
 from rasa.shared.nlu.constants import (
@@ -15,7 +26,6 @@ from rasa.shared.nlu.constants import (
     INTENT,
     TEXT,
     ENTITY_ATTRIBUTE_TYPE,
-    ENTITIES,
     INTENT_NAME_KEY,
 )
 
@@ -34,7 +44,7 @@ VISUALIZATION_TEMPLATE_PATH = "/visualization.html"
 
 
 class UserMessageGenerator:
-    def __init__(self, nlu_training_data) -> None:
+    def __init__(self, nlu_training_data: "TrainingData") -> None:
         self.nlu_training_data = nlu_training_data
         self.mapping = self._create_reverse_mapping(self.nlu_training_data)
 
@@ -53,35 +63,27 @@ class UserMessageGenerator:
         return d
 
     @staticmethod
-    def _contains_same_entity(entities, e) -> bool:
+    def _contains_same_entity(entities: Dict[Text, Any], e: Dict[Text, Any]) -> bool:
         return entities.get(e.get(ENTITY_ATTRIBUTE_TYPE)) is None or entities.get(
             e.get(ENTITY_ATTRIBUTE_TYPE)
         ) != e.get(ENTITY_ATTRIBUTE_VALUE)
 
     def message_for_data(self, structured_info: Dict[Text, Any]) -> Any:
-        """Find a data sample with the same intent and entities.
-
-        Given the parsed data from a message (intent and entities) finds a
-        message in the data that has the same intent and entities."""
-
+        """Find a data sample with the same intent."""
         if structured_info.get(INTENT) is not None:
             intent_name = structured_info.get(INTENT, {}).get(INTENT_NAME_KEY)
             usable_examples = self.mapping.get(intent_name, [])[:]
             random.shuffle(usable_examples)
-            for example in usable_examples:
-                entities = {
-                    e.get(ENTITY_ATTRIBUTE_TYPE): e.get(ENTITY_ATTRIBUTE_VALUE)
-                    for e in example.get(ENTITIES, [])
-                }
-                for e in structured_info.get(ENTITIES, []):
-                    if self._contains_same_entity(entities, e):
-                        break
-                else:
-                    return example.get(TEXT)
+
+            if usable_examples:
+                return usable_examples[0].get(TEXT)
+
         return structured_info.get(TEXT)
 
 
-def _fingerprint_node(graph, node, max_history) -> Set[Text]:
+def _fingerprint_node(
+    graph: "networkx.MultiDiGraph", node: int, max_history: int
+) -> Set[Text]:
     """Fingerprint a node in a graph.
 
     Can be used to identify nodes that are similar and can be merged within the
@@ -97,7 +99,7 @@ def _fingerprint_node(graph, node, max_history) -> Set[Text]:
 
     # the candidate list contains all node paths that haven't been
     # extended till `max_history` length yet.
-    candidates = deque()
+    candidates: Deque = deque()
     candidates.append([node])
     continuations = []
     while len(candidates) > 0:
@@ -123,15 +125,17 @@ def _fingerprint_node(graph, node, max_history) -> Set[Text]:
     }
 
 
-def _incoming_edges(graph, node) -> set:
+def _incoming_edges(graph: "networkx.MultiDiGraph", node: int) -> set:
     return {(prev_node, k) for prev_node, _, k in graph.in_edges(node, keys=True)}
 
 
-def _outgoing_edges(graph, node) -> set:
+def _outgoing_edges(graph: "networkx.MultiDiGraph", node: int) -> set:
     return {(succ_node, k) for _, succ_node, k in graph.out_edges(node, keys=True)}
 
 
-def _outgoing_edges_are_similar(graph, node_a, node_b) -> bool:
+def _outgoing_edges_are_similar(
+    graph: "networkx.MultiDiGraph", node_a: int, node_b: int
+) -> bool:
     """If the outgoing edges from the two nodes are similar enough,
     it doesn't matter if you are in a or b.
 
@@ -152,7 +156,9 @@ def _outgoing_edges_are_similar(graph, node_a, node_b) -> bool:
     return a_edges == b_edges or not a_edges or not b_edges
 
 
-def _nodes_are_equivalent(graph, node_a, node_b, max_history) -> bool:
+def _nodes_are_equivalent(
+    graph: "networkx.MultiDiGraph", node_a: int, node_b: int, max_history: int
+) -> bool:
     """Decides if two nodes are equivalent based on their fingerprints."""
     return graph.nodes[node_a]["label"] == graph.nodes[node_b]["label"] and (
         _outgoing_edges_are_similar(graph, node_a, node_b)
@@ -162,7 +168,14 @@ def _nodes_are_equivalent(graph, node_a, node_b, max_history) -> bool:
     )
 
 
-def _add_edge(graph, u, v, key, label=None, **kwargs) -> None:
+def _add_edge(
+    graph: "networkx.MultiDiGraph",
+    u: int,
+    v: int,
+    key: Optional[Text],
+    label: Optional[Text] = None,
+    **kwargs: Any,
+) -> None:
     """Adds an edge to the graph if the edge is not already present. Uses the
     label as the key."""
 
@@ -179,7 +192,9 @@ def _add_edge(graph, u, v, key, label=None, **kwargs) -> None:
         _transfer_style(kwargs, d)
 
 
-def _transfer_style(source, target: Dict[Text, Any]) -> Dict[Text, Any]:
+def _transfer_style(
+    source: Dict[Text, Any], target: Dict[Text, Any]
+) -> Dict[Text, Any]:
     """Copy over class names from source to target for all special classes.
 
     Used if a node is highlighted and merged with another node."""
@@ -199,7 +214,7 @@ def _transfer_style(source, target: Dict[Text, Any]) -> Dict[Text, Any]:
     return target
 
 
-def _merge_equivalent_nodes(graph, max_history) -> None:
+def _merge_equivalent_nodes(graph: "networkx.MultiDiGraph", max_history: int) -> None:
     """Searches for equivalent nodes in the graph and merges them."""
 
     changed = True
@@ -251,17 +266,19 @@ def _merge_equivalent_nodes(graph, max_history) -> None:
                         graph.remove_node(j)
 
 
-async def _replace_edge_labels_with_nodes(
-    graph, next_id, interpreter, nlu_training_data
+def _replace_edge_labels_with_nodes(
+    graph: "networkx.MultiDiGraph", next_id: int, nlu_training_data: "TrainingData"
 ) -> None:
-    """User messages are created as edge labels. This removes the labels and
+    """Replaces edge labels with nodes.
+
+    User messages are created as edge labels. This removes the labels and
     creates nodes instead.
 
     The algorithms (e.g. merging) are simpler if the user messages are labels
     on the edges. But it sometimes
     looks better if in the final graphs the user messages are nodes instead
-    of edge labels."""
-
+    of edge labels.
+    """
     if nlu_training_data:
         message_generator = UserMessageGenerator(nlu_training_data)
     else:
@@ -270,11 +287,14 @@ async def _replace_edge_labels_with_nodes(
     edges = list(graph.edges(keys=True, data=True))
     for s, e, k, d in edges:
         if k != EDGE_NONE_LABEL:
-            if message_generator and d.get("label", k) is not None:
-                parsed_info = await interpreter.parse(d.get("label", k))
+            label = d.get("label", k)
+
+            if message_generator:
+                parsed_info = {TEXT: label}
+                if label.startswith(INTENT_MESSAGE_PREFIX):
+                    parsed_info[INTENT] = {INTENT_NAME_KEY: label[1:]}
+
                 label = message_generator.message_for_data(parsed_info)
-            else:
-                label = d.get("label", k)
             next_id += 1
             graph.remove_edge(s, e, k)
             graph.add_node(
@@ -315,20 +335,26 @@ def persist_graph(graph: "networkx.Graph", output_file: Text) -> None:
 
 def _length_of_common_action_prefix(this: List[Event], other: List[Event]) -> int:
     """Calculate number of actions that two conversations have in common."""
-
     num_common_actions = 0
-    t_cleaned = [e for e in this if e.type_name in {"user", "action"}]
-    o_cleaned = [e for e in other if e.type_name in {"user", "action"}]
+    t_cleaned = cast(
+        List[Union[ActionExecuted, UserUttered]],
+        [e for e in this if e.type_name in {"user", "action"}],
+    )
+    o_cleaned = cast(
+        List[Union[ActionExecuted, UserUttered]],
+        [e for e in other if e.type_name in {"user", "action"}],
+    )
 
     for i, e in enumerate(t_cleaned):
+        o = o_cleaned[i]
         if i == len(o_cleaned):
             break
-        elif isinstance(e, UserUttered) and isinstance(o_cleaned[i], UserUttered):
+        elif isinstance(e, UserUttered) and isinstance(o, UserUttered):
             continue
         elif (
             isinstance(e, ActionExecuted)
-            and isinstance(o_cleaned[i], ActionExecuted)
-            and o_cleaned[i].action_name == e.action_name
+            and isinstance(o, ActionExecuted)
+            and o.action_name == e.action_name
         ):
             num_common_actions += 1
         else:
@@ -374,7 +400,7 @@ def _add_message_edge(
     current_node: int,
     next_node_idx: int,
     is_current: bool,
-):
+) -> None:
     """Create an edge based on the user message."""
 
     if message:
@@ -394,19 +420,17 @@ def _add_message_edge(
     )
 
 
-async def visualize_neighborhood(
+def visualize_neighborhood(
     current: Optional[List[Event]],
     event_sequences: List[List[Event]],
     output_file: Optional[Text] = None,
     max_history: int = 2,
-    interpreter: NaturalLanguageInterpreter = RegexInterpreter(),
     nlu_training_data: Optional["TrainingData"] = None,
     should_merge_nodes: bool = True,
     max_distance: int = 1,
     fontsize: int = 12,
-):
+) -> "networkx.MultiDiGraph":
     """Given a set of event lists, visualizing the flows."""
-
     graph = _create_graph(fontsize)
     _add_default_nodes(graph)
 
@@ -430,10 +454,8 @@ async def visualize_neighborhood(
                 idx -= 1
                 break
             if isinstance(el, UserUttered):
-                if not el.intent:
-                    message = await interpreter.parse(el.text)
-                else:
-                    message = el.parse_data
+                message = el.parse_data
+                message[TEXT] = f"{INTENT_MESSAGE_PREFIX}{el.intent_name}"
             elif (
                 isinstance(el, ActionExecuted) and el.action_name != ACTION_LISTEN_NAME
             ):
@@ -457,16 +479,20 @@ async def visualize_neighborhood(
         # this can either be an ellipsis "...", the conversation end node
         # "END" or a "TMP" node if this is the active conversation
         if is_current:
+            event_idx = events[idx]
             if (
-                isinstance(events[idx], ActionExecuted)
-                and events[idx].action_name == ACTION_LISTEN_NAME
+                isinstance(event_idx, ActionExecuted)
+                and event_idx.action_name == ACTION_LISTEN_NAME
             ):
                 next_node_idx += 1
+                if message is None:
+                    label = "  ?  "
+                else:
+                    intent = cast(dict, message).get("intent", {})
+                    label = intent.get("name", "  ?  ")
                 graph.add_node(
                     next_node_idx,
-                    label="  ?  "
-                    if not message
-                    else message.get("intent", {}).get("name", "  ?  "),
+                    label=label,
                     shape="rect",
                     **{"class": "intent dashed active"},
                 )
@@ -491,9 +517,7 @@ async def visualize_neighborhood(
 
     if should_merge_nodes:
         _merge_equivalent_nodes(graph, max_history)
-    await _replace_edge_labels_with_nodes(
-        graph, next_node_idx, interpreter, nlu_training_data
-    )
+    _replace_edge_labels_with_nodes(graph, next_node_idx, nlu_training_data)
 
     _remove_auxiliary_nodes(graph, special_node_idx)
 
@@ -522,18 +546,16 @@ def _remove_auxiliary_nodes(
                 ps.add(pred)
 
 
-async def visualize_stories(
+def visualize_stories(
     story_steps: List[StoryStep],
     domain: Domain,
     output_file: Optional[Text],
     max_history: int,
-    interpreter: NaturalLanguageInterpreter = RegexInterpreter(),
     nlu_training_data: Optional["TrainingData"] = None,
     should_merge_nodes: bool = True,
     fontsize: int = 12,
-):
-    """Given a set of stories, generates a graph visualizing the flows in the
-    stories.
+) -> "networkx.MultiDiGraph":
+    """Given a set of stories, generates a graph visualizing the flows in the stories.
 
     Visualization is always a trade off between making the graph as small as
     possible while
@@ -558,8 +580,8 @@ async def visualize_stories(
     The training data parameter can be used to pass in a Rasa NLU training
     data instance. It will
     be used to replace the user messages from the story file with actual
-    messages from the training data."""
-
+    messages from the training data.
+    """
     story_graph = StoryGraph(story_steps)
 
     g = TrainingDataGenerator(
@@ -572,12 +594,11 @@ async def visualize_stories(
     completed_trackers = g.generate()
     event_sequences = [t.events for t in completed_trackers]
 
-    graph = await visualize_neighborhood(
+    graph = visualize_neighborhood(
         None,
         event_sequences,
         output_file,
         max_history,
-        interpreter,
         nlu_training_data,
         should_merge_nodes,
         max_distance=1,

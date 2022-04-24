@@ -17,7 +17,8 @@ from rasa.shared.nlu.constants import (
 class WitEmulator(Emulator):
     """Emulates the response format of this wit.ai endpoint.
 
-    More information about the endpoint: https://wit.ai/docs/http/20200513/#get__message_link
+    More information about the endpoint:
+    https://wit.ai/docs/http/20200513/#get__message_link
     """
 
     def normalise_response_json(self, data: Dict[Text, Any]) -> Dict[Text, Any]:
@@ -34,7 +35,7 @@ class WitEmulator(Emulator):
             entity_name = entity[ENTITY_ATTRIBUTE_TYPE]
             role = entity.get(ENTITY_ATTRIBUTE_ROLE, entity_name)
             entity_name_including_role = f"{entity[ENTITY_ATTRIBUTE_TYPE]}:{role}"
-            normalized_entity = {
+            normalized_entity: Dict[Text, Any] = {
                 "confidence": entity.get("confidence_entity") or 1,
                 "name": entity_name,
                 "value": entity[ENTITY_ATTRIBUTE_VALUE],

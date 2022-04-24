@@ -15,14 +15,15 @@ from rasa.nlu.emulators.emulator import Emulator
 
 
 class DialogflowEmulator(Emulator):
-    """Emulates the response format of the DialogFlow projects.agent.environments.users.sessions.detectIntent
+    """Emulates the response format of the DialogFlow.
 
+    # noqa: W505
     https://cloud.google.com/dialogflow/es/docs/reference/rest/v2/projects.agent.environments.users.sessions/detectIntent
     https://cloud.google.com/dialogflow/es/docs/reference/rest/v2/DetectIntentResponse
     """
 
     def normalise_response_json(self, data: Dict[Text, Any]) -> Dict[Text, Any]:
-        """"Transform response JSON to DialogFlow format.
+        """Transform response JSON to DialogFlow format.
 
         Args:
             data: input JSON data as a dictionary.

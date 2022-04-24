@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import logging
 import typing
 from typing import List, Text, Optional
@@ -12,10 +13,10 @@ from rasa.cli.arguments import export as arguments
 from rasa.shared.constants import DOCS_URL_EVENT_BROKERS, DOCS_URL_TRACKER_STORES
 from rasa.exceptions import PublishingError
 from rasa.shared.exceptions import RasaException
+from rasa.core.brokers.pika import PikaEventBroker
 
 if typing.TYPE_CHECKING:
     from rasa.core.brokers.broker import EventBroker
-    from rasa.core.brokers.pika import PikaEventBroker
     from rasa.core.tracker_store import TrackerStore
     from rasa.core.exporter import Exporter
     from rasa.core.utils import AvailableEndpoints
@@ -143,7 +144,9 @@ def _assert_max_timestamp_is_greater_than_min_timestamp(
 
 
 def _prepare_event_broker(event_broker: "EventBroker") -> None:
-    """Sets `should_keep_unpublished_messages` flag to `False` if
+    """Prepares event broker to export tracker events.
+
+    Sets `should_keep_unpublished_messages` flag to `False` if
     `self.event_broker` is a `PikaEventBroker`.
 
     If publishing of events fails, the `PikaEventBroker` instance should not keep a
@@ -154,8 +157,6 @@ def _prepare_event_broker(event_broker: "EventBroker") -> None:
     In addition, wait until the event broker reports a `ready` state.
 
     """
-    from rasa.core.brokers.pika import PikaEventBroker
-
     if isinstance(event_broker, PikaEventBroker):
         event_broker.should_keep_unpublished_messages = False
         event_broker.raise_on_failure = True
@@ -172,7 +173,7 @@ def export_trackers(args: argparse.Namespace) -> None:
     Args:
         args: Command-line arguments to process.
     """
-    rasa.utils.common.run_in_loop(_export_trackers(args))
+    asyncio.run(_export_trackers(args))
 
 
 async def _export_trackers(args: argparse.Namespace) -> None:

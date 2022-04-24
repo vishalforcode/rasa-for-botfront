@@ -1,11 +1,11 @@
-from typing import Any, Dict, List, Text, Tuple, Optional, NamedTuple
+import abc
+from typing import Any, Dict, List, NamedTuple, Text, Tuple, Optional
 
 import rasa.shared.utils.io
 from rasa.shared.constants import DOCS_URL_TRAINING_DATA_NLU
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.nlu.training_data.message import Message
 from rasa.nlu.tokenizers.tokenizer import Token
-from rasa.nlu.components import Component
 from rasa.nlu.constants import (
     TOKENS_NAMES,
     ENTITY_ATTRIBUTE_CONFIDENCE_TYPE,
@@ -25,7 +25,6 @@ from rasa.shared.nlu.constants import (
     ENTITY_ATTRIBUTE_ROLE,
     NO_ENTITY_TAG,
     SPLIT_ENTITIES_BY_COMMA,
-    SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE,
     SINGLE_ENTITY_ALLOWED_INTERLEAVING_CHARSET,
 )
 import rasa.utils.train_utils
@@ -40,12 +39,18 @@ class EntityTagSpec(NamedTuple):
     num_tags: int
 
 
-class EntityExtractor(Component):
-    """Entity extractors are components which extract entities.
+class EntityExtractorMixin(abc.ABC):
+    """Provides functionality for components that do entity extraction.
 
-    They can be placed in the pipeline like other components, and can extract
-    entities like a person's name, or a location.
+    Inheriting from this class will add utility functions for entity extraction.
+    Entity extraction is the process of identifying and extracting entities like a
+    person's name, or a location from a message.
     """
+
+    @property
+    def name(self) -> Text:
+        """Returns the name of the class."""
+        return self.__class__.__name__
 
     def add_extractor_name(
         self, entities: List[Dict[Text, Any]]
@@ -77,24 +82,6 @@ class EntityExtractor(Component):
             entity["processors"] = [self.name]
 
         return entity
-
-    def init_split_entities(self) -> Dict[Text, bool]:
-        """Initialises the behaviour for splitting entities by comma (or not).
-
-        Returns:
-            Defines desired behaviour for splitting specific entity types and
-            default behaviour for splitting any entity types for which no
-            behaviour is defined.
-        """
-        split_entities_config = self.component_config.get(
-            SPLIT_ENTITIES_BY_COMMA, SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
-        )
-        default_value = self.defaults.get(
-            SPLIT_ENTITIES_BY_COMMA, SPLIT_ENTITIES_BY_COMMA_DEFAULT_VALUE
-        )
-        return rasa.utils.train_utils.init_split_entities(
-            split_entities_config, default_value
-        )
 
     @staticmethod
     def filter_irrelevant_entities(extracted: list, requested_dimensions: set) -> list:
@@ -195,7 +182,7 @@ class EntityExtractor(Component):
         last_token_end = -1
 
         for idx, token in enumerate(tokens):
-            current_entity_tag = EntityExtractor.get_tag_for(
+            current_entity_tag = EntityExtractorMixin.get_tag_for(
                 tags, ENTITY_ATTRIBUTE_TYPE, idx
             )
 
@@ -204,11 +191,11 @@ class EntityExtractor(Component):
                 last_token_end = token.end
                 continue
 
-            current_group_tag = EntityExtractor.get_tag_for(
+            current_group_tag = EntityExtractorMixin.get_tag_for(
                 tags, ENTITY_ATTRIBUTE_GROUP, idx
             )
             current_group_tag = bilou_utils.tag_without_prefix(current_group_tag)
-            current_role_tag = EntityExtractor.get_tag_for(
+            current_role_tag = EntityExtractorMixin.get_tag_for(
                 tags, ENTITY_ATTRIBUTE_ROLE, idx
             )
             current_role_tag = bilou_utils.tag_without_prefix(current_role_tag)
@@ -250,7 +237,7 @@ class EntityExtractor(Component):
 
             if new_tag_found:
                 # new entity found
-                entity = EntityExtractor._create_new_entity(
+                entity = EntityExtractorMixin._create_new_entity(
                     list(tags.keys()),
                     current_entity_tag,
                     current_group_tag,
@@ -260,7 +247,7 @@ class EntityExtractor(Component):
                     confidences,
                 )
                 entities.append(entity)
-            elif EntityExtractor._check_is_single_entity(
+            elif EntityExtractorMixin._check_is_single_entity(
                 text, token, last_token_end, split_entities_config, current_entity_tag
             ):
                 # current token has the same entity tag as the token before and
@@ -269,7 +256,7 @@ class EntityExtractor(Component):
                 # and a whitespace.
                 entities[-1][ENTITY_ATTRIBUTE_END] = token.end
                 if confidences is not None:
-                    EntityExtractor._update_confidence_values(
+                    EntityExtractorMixin._update_confidence_values(
                         entities, confidences, idx
                     )
 
@@ -278,7 +265,7 @@ class EntityExtractor(Component):
                 # tokens are separated by at least 2 symbols (e.g. multiple spaces,
                 # a comma and a space, etc.) and also shouldn't be represented as a
                 # single entity
-                entity = EntityExtractor._create_new_entity(
+                entity = EntityExtractorMixin._create_new_entity(
                     list(tags.keys()),
                     current_entity_tag,
                     current_group_tag,
@@ -303,7 +290,7 @@ class EntityExtractor(Component):
     @staticmethod
     def _update_confidence_values(
         entities: List[Dict[Text, Any]], confidences: Dict[Text, List[float]], idx: int
-    ):
+    ) -> None:
         # use the lower confidence value
         entities[-1][ENTITY_ATTRIBUTE_CONFIDENCE_TYPE] = min(
             entities[-1][ENTITY_ATTRIBUTE_CONFIDENCE_TYPE],
@@ -327,7 +314,7 @@ class EntityExtractor(Component):
         last_token_end: int,
         split_entities_config: Dict[Text, bool],
         current_entity_tag: Text,
-    ):
+    ) -> bool:
         # current token has the same entity tag as the token before and
         # the two tokens are only separated by at most one symbol (e.g. space,
         # dash, etc.)
@@ -335,10 +322,14 @@ class EntityExtractor(Component):
             return True
 
         # Tokens need to be no further than 3 positions apart
-        # The magic number 3 is chosen such that the following two cases can be extracted
-        #   - Schönhauser Allee 175, 10119 Berlin (address compounds separated by 2 tokens (", "))
-        #   - 22 Powderhall Rd., EH7 4GB (abbreviated "Rd." results in a separation of 3 tokens ("., "))
-        # More than 3 might already introduce cases that shouldn't be considered by this logic
+        # The magic number 3 is chosen such that the following two cases can be
+        # extracted
+        #   - Schönhauser Allee 175, 10119 Berlin
+        #     (address compounds separated by 2 tokens (", "))
+        #   - 22 Powderhall Rd., EH7 4GB
+        #     (abbreviated "Rd." results in a separation of 3 tokens ("., "))
+        # More than 3 might already introduce cases that shouldn't be considered by
+        # this logic
         tokens_within_range = token.start - last_token_end <= 3
 
         # The interleaving tokens *must* be a full stop, a comma, or a whitespace
@@ -465,13 +456,16 @@ class EntityExtractor(Component):
                         for t in example.get(TOKENS_NAMES[TEXT])
                     ]
                     rasa.shared.utils.io.raise_warning(
-                        f"Misaligned entity annotation in message '{example.get(TEXT)}' "
-                        f"with intent '{example.get(INTENT)}'. Make sure the start and "
-                        f"end values of entities ({entities_repr}) in the training "
+                        f"Misaligned entity annotation in message "
+                        f"'{example.get(TEXT)}' with intent '{example.get(INTENT)}'. "
+                        f"Make sure the start and end values of entities "
+                        f"({entities_repr}) in the training "
                         f"data match the token boundaries ({tokens_repr}). "
-                        "Common causes: \n  1) entities include trailing whitespaces or punctuation"
+                        "Common causes: \n  1) entities include trailing whitespaces "
+                        "or punctuation"
                         "\n  2) the tokenizer gives an unexpected result, due to "
-                        "languages such as Chinese that don't use whitespace for word separation",
+                        "languages such as Chinese that don't use whitespace for word "
+                        "separation",
                         docs=DOCS_URL_TRAINING_DATA_NLU,
                     )
                     break

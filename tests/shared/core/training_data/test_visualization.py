@@ -1,13 +1,14 @@
 from pathlib import Path
 from typing import Text
 
-import pytest
-
 import rasa.shared.utils.io
 from rasa.shared.core.domain import Domain
 from rasa.shared.core.events import ActionExecuted, SlotSet, UserUttered
 from rasa.shared.core.training_data import visualization
 import rasa.utils.io
+from rasa.shared.nlu.constants import TEXT, INTENT
+from rasa.shared.nlu.training_data.message import Message
+from rasa.shared.nlu.training_data.training_data import TrainingData
 
 
 def test_style_transfer():
@@ -80,24 +81,18 @@ def test_common_action_prefix_unequal():
     assert num_common == 0
 
 
-@pytest.mark.parametrize(
-    "stories_file",
-    ["data/test_stories/stories.md", "data/test_yaml_stories/stories.yml"],
-)
-async def test_graph_persistence(
-    stories_file: Text, default_domain: Domain, tmp_path: Path
-):
+def test_graph_persistence(domain: Domain, tmp_path: Path):
     from os.path import isfile
     from networkx.drawing import nx_pydot
     import rasa.shared.core.training_data.loading as core_loading
 
-    story_steps = await core_loading.load_data_from_resource(
-        stories_file, default_domain
+    story_steps = core_loading.load_data_from_resource(
+        "data/test_yaml_stories/stories.yml", domain
     )
     out_file = str(tmp_path / "graph.html")
-    generated_graph = await visualization.visualize_stories(
+    generated_graph = visualization.visualize_stories(
         story_steps,
-        default_domain,
+        domain,
         output_file=out_file,
         max_history=3,
         should_merge_nodes=False,
@@ -113,23 +108,83 @@ async def test_graph_persistence(
     assert "graph = `{}`".format(generated_graph.to_string()) in content
 
 
-@pytest.mark.parametrize(
-    "stories_file",
-    ["data/test_stories/stories.md", "data/test_yaml_stories/stories.yml"],
-)
-async def test_merge_nodes(stories_file: Text, default_domain: Domain, tmp_path: Path):
+def test_merge_nodes(domain: Domain, tmp_path: Path):
     from os.path import isfile
     import rasa.shared.core.training_data.loading as core_loading
 
-    story_steps = await core_loading.load_data_from_resource(
-        stories_file, default_domain
+    story_steps = core_loading.load_data_from_resource(
+        "data/test_yaml_stories/stories.yml", domain
     )
     out_file = str(tmp_path / "graph.html")
-    await visualization.visualize_stories(
+    visualization.visualize_stories(
         story_steps,
-        default_domain,
+        domain,
         output_file=out_file,
         max_history=3,
         should_merge_nodes=True,
     )
     assert isfile(out_file)
+
+
+def test_story_visualization(domain: Domain, tmp_path: Path):
+    import rasa.shared.core.training_data.loading as core_loading
+
+    story_steps = core_loading.load_data_from_resource(
+        "data/test_yaml_stories/stories.yml", domain
+    )
+    out_file = tmp_path / "graph.html"
+    generated_graph = visualization.visualize_stories(
+        story_steps,
+        domain,
+        output_file=str(out_file),
+        max_history=3,
+        should_merge_nodes=False,
+    )
+
+    assert str(None) not in out_file.read_text()
+    assert "/affirm" in out_file.read_text()
+    assert len(generated_graph.nodes()) == 51
+    assert len(generated_graph.edges()) == 56
+
+
+def test_story_visualization_with_training_data(
+    domain: Domain, tmp_path: Path, nlu_data_path: Text
+):
+    import rasa.shared.core.training_data.loading as core_loading
+
+    story_steps = core_loading.load_data_from_resource(
+        "data/test_yaml_stories/stories.yml", domain
+    )
+    out_file = tmp_path / "graph.html"
+    test_text = "test text"
+    test_intent = "affirm"
+    generated_graph = visualization.visualize_stories(
+        story_steps,
+        domain,
+        output_file=str(out_file),
+        max_history=3,
+        should_merge_nodes=False,
+        nlu_training_data=TrainingData(
+            [Message({TEXT: test_text, INTENT: test_intent})]
+        ),
+    )
+
+    assert test_text in out_file.read_text()
+    assert test_intent not in out_file.read_text()
+
+    assert len(generated_graph.nodes()) == 51
+    assert len(generated_graph.edges()) == 56
+
+
+def test_story_visualization_with_merging(domain: Domain):
+    import rasa.shared.core.training_data.loading as core_loading
+
+    story_steps = core_loading.load_data_from_resource(
+        "data/test_yaml_stories/stories.yml", domain
+    )
+    generated_graph = visualization.visualize_stories(
+        story_steps, domain, output_file=None, max_history=3, should_merge_nodes=True
+    )
+    assert 15 < len(generated_graph.nodes()) < 33
+
+    assert 20 < len(generated_graph.edges()) < 33

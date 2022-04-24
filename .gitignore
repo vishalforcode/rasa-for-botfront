@@ -40,6 +40,7 @@ lastmile_ai/learn/plots/
 .venv/
 *.iml
 out/
+.vscode/
 tmp_training_data.json
 .DS_Store
 models/
@@ -66,6 +67,7 @@ examples/moodbot/errors.json
 examples/formbot/models*
 examples/concertbot/models*
 examples/moodbot/models*
+examples/e2ebot/results/*
 failed_stories.md
 errors.json
 pip-wheel-metadata/*
@@ -82,7 +84,7 @@ env
 .history
 rasa/segment_key
 rasa/keys
-docs/
-
+.rasa
+/results/
 # Local Netlify folder
 .netlify

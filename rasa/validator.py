@@ -1,23 +1,27 @@
+import itertools
 import logging
 from collections import defaultdict
-from typing import Set, Text, Optional, Dict, Any
+from typing import Set, Text, Optional, Dict, Any, List
 
 import rasa.core.training.story_conflict
 import rasa.shared.nlu.constants
 from rasa.shared.constants import (
-    DOCS_BASE_URL,
     DOCS_URL_DOMAINS,
+    DOCS_URL_FORMS,
     UTTER_PREFIX,
     DOCS_URL_ACTIONS,
+    REQUIRED_SLOTS_KEY,
 )
-from rasa.shared.core.domain import Domain
-from rasa.shared.core.events import ActionExecuted
+from rasa.shared.core import constants
+from rasa.shared.core.constants import MAPPING_CONDITIONS, ACTIVE_LOOP
+from rasa.shared.core.events import ActionExecuted, ActiveLoop
 from rasa.shared.core.events import UserUttered
+from rasa.shared.core.domain import Domain
 from rasa.shared.core.generator import TrainingDataGenerator
+from rasa.shared.core.constants import SlotMappingType, MAPPING_TYPE
 from rasa.shared.core.training_data.structures import StoryGraph
 from rasa.shared.importers.importer import TrainingDataImporter
 from rasa.shared.nlu.training_data.training_data import TrainingData
-from rasa.nlu.config import RasaNLUModelConfig
 import rasa.shared.utils.io
 
 logger = logging.getLogger(__name__)
@@ -44,17 +48,23 @@ class Validator:
         self.domain = domain
         self.intents = intents
         self.story_graph = story_graph
-        self.nlu_config = RasaNLUModelConfig(config)
 
     @classmethod
-    async def from_importer(cls, importer: TrainingDataImporter) -> "Validator":
+    def from_importer(cls, importer: TrainingDataImporter) -> "Validator":
         """Create an instance from the domain, nlu and story files."""
-        domain = await importer.get_domain()
-        story_graph = await importer.get_stories()
-        intents = await importer.get_nlu_data()
-        config = await importer.get_config()
+        domain = importer.get_domain()
+        story_graph = importer.get_stories()
+        intents = importer.get_nlu_data()
+        config = importer.get_config()
 
         return cls(domain, intents, story_graph, config)
+
+    def _non_default_intents(self) -> List[Text]:
+        return [
+            item
+            for item in self.domain.intents
+            if item not in constants.DEFAULT_INTENTS
+        ]
 
     def verify_intents(self, ignore_warnings: bool = True) -> bool:
         """Compares list of intents in domain with intents in NLU training data."""
@@ -62,9 +72,9 @@ class Validator:
 
         nlu_data_intents = {e.data["intent"] for e in self.intents.intent_examples}
 
-        for intent in self.domain.intents:
+        for intent in self._non_default_intents():
             if intent not in nlu_data_intents:
-                logger.debug(
+                rasa.shared.utils.io.raise_warning(
                     f"The intent '{intent}' is listed in the domain file, but "
                     f"is not found in the NLU training data."
                 )
@@ -119,7 +129,7 @@ class Validator:
             event.intent["name"]
             for story in self.story_graph.story_steps
             for event in story.events
-            if type(event) == UserUttered
+            if type(event) == UserUttered and event.intent_name is not None
         }
 
         for story_intent in stories_intents:
@@ -132,61 +142,40 @@ class Validator:
                 )
                 everything_is_alright = False
 
-        for intent in self.domain.intents:
+        for intent in self._non_default_intents():
             if intent not in stories_intents:
-                logger.debug(f"The intent '{intent}' is not used in any story.")
+                rasa.shared.utils.io.raise_warning(
+                    f"The intent '{intent}' is not used in any story or rule."
+                )
                 everything_is_alright = ignore_warnings and everything_is_alright
 
         return everything_is_alright
 
     def _gather_utterance_actions(self) -> Set[Text]:
-        """Return all utterances which are actions."""
+        """Return all utterances which are actions.
 
-        responses = {
+        Returns:
+            A set of response names found in the domain and data files, with the
+            response key stripped in the case of response selector responses.
+        """
+        domain_responses = {
+            response.split(rasa.shared.nlu.constants.RESPONSE_IDENTIFIER_DELIMITER)[0]
+            for response in self.domain.responses.keys()
+            if response in self.domain.action_names_or_texts
+        }
+        data_responses = {
             response.split(rasa.shared.nlu.constants.RESPONSE_IDENTIFIER_DELIMITER)[0]
             for response in self.intents.responses.keys()
         }
-        return responses | {
-            utterance
-            for utterance in self.domain.templates.keys()
-            if utterance in self.domain.action_names_or_texts
-        }
-
-    def verify_utterances(self, ignore_warnings: bool = True) -> bool:
-        """Compares list of utterances in actions with utterances in responses."""
-        actions = self.domain.action_names_or_texts
-        utterance_templates = set(self.domain.templates)
-        everything_is_alright = True
-
-        for utterance in utterance_templates:
-            if utterance not in actions:
-                logger.debug(
-                    f"The utterance '{utterance}' is not listed under 'actions' in the "
-                    f"domain file. It can only be used as a template."
-                )
-                everything_is_alright = ignore_warnings and everything_is_alright
-
-        for action in actions:
-            if action.startswith(UTTER_PREFIX):
-                if action not in utterance_templates:
-                    rasa.shared.utils.io.raise_warning(
-                        f"There is no template for the utterance action '{action}'. "
-                        f"The action is listed in your domains action list, but "
-                        f"there is no template defined with this name. You should "
-                        f"add a template with this key.",
-                        docs=DOCS_URL_ACTIONS + "#utterance-actions",
-                    )
-                    everything_is_alright = False
-
-        return everything_is_alright
+        return domain_responses.union(data_responses)
 
     def verify_utterances_in_stories(self, ignore_warnings: bool = True) -> bool:
         """Verifies usage of utterances in stories.
 
         Checks whether utterances used in the stories are valid,
-        and whether all valid utterances are used in stories."""
-
-        everything_is_alright = self.verify_utterances()
+        and whether all valid utterances are used in stories.
+        """
+        everything_is_alright = True
 
         utterance_actions = self._gather_utterance_actions()
         stories_utterances = set()
@@ -195,6 +184,10 @@ class Validator:
             for event in story.events:
                 if not isinstance(event, ActionExecuted):
                     continue
+
+                if not event.action_name:
+                    continue
+
                 if not event.action_name.startswith(UTTER_PREFIX):
                     # we are only interested in utter actions
                     continue
@@ -216,8 +209,74 @@ class Validator:
 
         for utterance in utterance_actions:
             if utterance not in stories_utterances:
-                logger.debug(f"The utterance '{utterance}' is not used in any story.")
+                rasa.shared.utils.io.raise_warning(
+                    f"The utterance '{utterance}' is not used in any story or rule."
+                )
                 everything_is_alright = ignore_warnings and everything_is_alright
+
+        return everything_is_alright
+
+    def verify_forms_in_stories_rules(self) -> bool:
+        """Verifies that forms referenced in active_loop directives are present."""
+        all_forms_exist = True
+        visited_loops = set()
+
+        for story in self.story_graph.story_steps:
+            for event in story.events:
+                if not isinstance(event, ActiveLoop):
+                    continue
+
+                if event.name in visited_loops:
+                    # We've seen this loop before, don't alert on it twice
+                    continue
+
+                if not event.name:
+                    # To support setting `active_loop` to `null`
+                    continue
+
+                if event.name not in self.domain.form_names:
+                    rasa.shared.utils.io.raise_warning(
+                        f"The form '{event.name}' is used in the "
+                        f"'{story.block_name}' block, but it "
+                        f"is not listed in the domain file. You should add it to your "
+                        f"domain file!",
+                        docs=DOCS_URL_FORMS,
+                    )
+                    all_forms_exist = False
+                visited_loops.add(event.name)
+
+        return all_forms_exist
+
+    def verify_actions_in_stories_rules(self) -> bool:
+        """Verifies that actions used in stories and rules are present in the domain."""
+        everything_is_alright = True
+        visited = set()
+
+        for story in self.story_graph.story_steps:
+            for event in story.events:
+                if not isinstance(event, ActionExecuted):
+                    continue
+
+                if not event.action_name:
+                    continue
+
+                if not event.action_name.startswith("action_"):
+                    continue
+
+                if event.action_name in visited:
+                    # we already processed this one before, we only want to warn once
+                    continue
+
+                if event.action_name not in self.domain.action_names_or_texts:
+                    rasa.shared.utils.io.raise_warning(
+                        f"The action '{event.action_name}' is used in the "
+                        f"'{story.block_name}' block, but it "
+                        f"is not listed in the domain file. You should add it to your "
+                        f"domain file!",
+                        docs=DOCS_URL_DOMAINS,
+                    )
+                    everything_is_alright = False
+                visited.add(event.action_name)
 
         return everything_is_alright
 
@@ -228,7 +287,8 @@ class Validator:
 
         Args:
             ignore_warnings: When `True`, return `True` even if conflicts were found.
-            max_history: Maximal number of events to take into account for conflict identification.
+            max_history: Maximal number of events to take into account for conflict
+                identification.
 
         Returns:
             `False` is a conflict was found and `ignore_warnings` is `False`.
@@ -246,7 +306,7 @@ class Validator:
 
         # Create a list of `StoryConflict` objects
         conflicts = rasa.core.training.story_conflict.find_story_conflicts(
-            trackers, self.domain, max_history, self.nlu_config
+            trackers, self.domain, max_history
         )
 
         if not conflicts:
@@ -272,9 +332,93 @@ class Validator:
         stories_are_valid = self.verify_utterances_in_stories(ignore_warnings)
         return intents_are_valid and stories_are_valid and there_is_no_duplication
 
+    def verify_form_slots(self) -> bool:
+        """Verifies that form slots match the slot mappings in domain."""
+        domain_slot_names = [slot.name for slot in self.domain.slots]
+        everything_is_alright = True
+
+        for form in self.domain.form_names:
+            form_slots = self.domain.required_slots_for_form(form)
+            for slot in form_slots:
+                if slot in domain_slot_names:
+                    continue
+                else:
+                    rasa.shared.utils.io.raise_warning(
+                        f"The form slot '{slot}' in form '{form}' "
+                        f"is not present in the domain slots."
+                        f"Please add the correct slot or check for typos.",
+                        docs=DOCS_URL_DOMAINS,
+                    )
+                    everything_is_alright = False
+
+        return everything_is_alright
+
+    def verify_slot_mappings(self) -> bool:
+        """Verifies that slot mappings match forms."""
+        everything_is_alright = True
+
+        all_form_slots = [
+            required_slots[REQUIRED_SLOTS_KEY]
+            for required_slots in self.domain.forms.values()
+        ]
+        all_required_slots = set(itertools.chain.from_iterable(all_form_slots))
+
+        for slot in self.domain.slots:
+            for mapping in slot.mappings:
+                for condition in mapping.get(MAPPING_CONDITIONS, []):
+                    condition_active_loop = condition.get(ACTIVE_LOOP)
+                    if (
+                        condition_active_loop
+                        and condition_active_loop not in self.domain.form_names
+                    ):
+                        rasa.shared.utils.io.raise_warning(
+                            f"Slot '{slot.name}' has a mapping condition for form "
+                            f"'{condition_active_loop}' which is not listed in "
+                            f"domain forms. Please add this form to the forms section "
+                            f"or check for typos."
+                        )
+                        everything_is_alright = False
+
+                    form_slots = self.domain.forms.get(condition_active_loop, {}).get(
+                        REQUIRED_SLOTS_KEY, {}
+                    )
+                    if form_slots and slot.name not in form_slots:
+                        rasa.shared.utils.io.raise_warning(
+                            f"Slot '{slot.name}' has a mapping condition for form "
+                            f"'{condition_active_loop}', but it's not present in "
+                            f"'{condition_active_loop}' form's '{REQUIRED_SLOTS_KEY}'. "
+                            f"The slot needs to be added to this key."
+                        )
+                        everything_is_alright = False
+
+                if (
+                    mapping[MAPPING_TYPE] == str(SlotMappingType.FROM_TRIGGER_INTENT)
+                    and slot.name not in all_required_slots
+                ):
+                    rasa.shared.utils.io.raise_warning(
+                        f"Slot '{slot.name}' has a 'from_trigger_intent' mapping, "
+                        f"but it's not listed in any form '{REQUIRED_SLOTS_KEY}'."
+                    )
+                    everything_is_alright = False
+
+        return everything_is_alright
+
     def verify_domain_validity(self) -> bool:
         """Checks whether the domain returned by the importer is empty.
 
-        An empty domain is invalid."""
+        An empty domain or one that uses deprecated Mapping Policy is invalid.
+        """
+        if self.domain.is_empty():
+            return False
 
-        return not self.domain.is_empty()
+        for intent_key, intent_dict in self.domain.intent_properties.items():
+            if "triggers" in intent_dict:
+                rasa.shared.utils.io.raise_warning(
+                    f"The intent {intent_key} in the domain file "
+                    f"is using the MappingPolicy format "
+                    f"which has now been deprecated. "
+                    f"Please migrate to RulePolicy."
+                )
+                return False
+
+        return True

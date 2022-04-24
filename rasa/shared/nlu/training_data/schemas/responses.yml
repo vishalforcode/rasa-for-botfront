@@ -51,7 +51,17 @@ schema;responses:
               allowempty: True
           channel:
             type: "str"
-          language:
-            type: "str"
           metadata:
             type: "any"
+          condition:
+            type: "seq"
+            sequence:
+              - type: "map"
+                allowempty: False
+                mapping:
+                  type:
+                    type: "str"
+                  name:
+                    type: "str"
+                  value:
+                    type: "any"

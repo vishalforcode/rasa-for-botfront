@@ -1,14 +1,17 @@
 import logging
+import jwt
 from typing import Dict
 from unittest.mock import patch, MagicMock
 
 import pytest
+from _pytest.logging import LogCaptureFixture
 from _pytest.monkeypatch import MonkeyPatch
 from aiohttp import ClientTimeout
 from aioresponses import aioresponses
 from sanic import Sanic
 
 import rasa.core.run
+import rasa.core.channels.channel
 from rasa.core import utils
 from rasa.core.channels import RasaChatInput, console
 from rasa.core.channels.channel import UserMessage
@@ -18,6 +21,7 @@ from rasa.core.channels.rasa_chat import (
     INTERACTIVE_LEARNING_PERMISSION,
 )
 from rasa.core.channels.telegram import TelegramOutput
+from rasa.shared.exceptions import RasaException
 from rasa.utils.endpoints import EndpointConfig
 from tests.core import utilities
 
@@ -27,35 +31,16 @@ from tests.utilities import json_of_latest_request, latest_request
 logger = logging.getLogger(__name__)
 
 
-def fake_sanic_run(*args, **kwargs):
-    """Used to replace `run` method of a Sanic server to avoid hanging."""
-    logger.info("Rabatnic: Take this and find Sanic! I want him here by supper time.")
-
-
 def noop(*args, **kwargs):
     """Just do nothing."""
     pass
 
 
-def fake_telegram_me(*args, **kwargs):
-    """Return a fake telegram user."""
-    return {
-        "id": 0,
-        "first_name": "Test",
-        "is_bot": True,
-        "username": "YOUR_TELEGRAM_BOT",
-    }
-
-
-def fake_send_message(*args, **kwargs):
-    """Fake sending a message."""
-    return {"ok": True, "result": {}}
-
-
 async def test_send_response(default_channel, default_tracker):
     text_only_message = {"text": "hey"}
     multiline_text_message = {
-        "text": "This message should come first:  \n\nThis is message two  \nThis as well\n\n"
+        "text": "This message should come first:  \n\n"
+        "This is message two  \nThis as well\n\n"
     }
     image_only_message = {"image": "https://i.imgur.com/nGF1K8f.jpg"}
     text_and_image_message = {
@@ -140,29 +125,6 @@ async def test_console_input():
             b = json_of_latest_request(r)
 
             assert b == {"message": "Test Input", "sender": "default"}
-
-
-# USED FOR DOCS - don't rename without changing in the docs
-def test_facebook_channel():
-    # START DOC INCLUDE
-    from rasa.core.channels.facebook import FacebookInput
-
-    input_channel = FacebookInput(
-        fb_verify="YOUR_FB_VERIFY",
-        # you need tell facebook this token, to confirm your URL
-        fb_secret="YOUR_FB_SECRET",  # your app secret
-        fb_access_token="YOUR_FB_PAGE_ACCESS_TOKEN"
-        # token for the page you subscribed to
-    )
-
-    s = rasa.core.run.configure_app([input_channel], port=5004)
-    # END DOC INCLUDE
-    # the above marker marks the end of the code snipped included
-    # in the docs
-    routes_list = utils.list_routes(s)
-
-    assert routes_list["fb_webhook.health"].startswith("/webhooks/facebook")
-    assert routes_list["fb_webhook.webhook"].startswith("/webhooks/facebook/webhook")
 
 
 # USED FOR DOCS - don't rename without changing in the docs
@@ -315,6 +277,24 @@ def test_telegram_channel():
     )
 
 
+def test_telegram_channel_raise_rasa_exception_webhook_not_set():
+    from rasa.core.channels.telegram import TelegramInput
+
+    input_channel = TelegramInput(
+        # you get this when setting up a bot
+        access_token="123:YOUR_ACCESS_TOKEN",
+        # this is your bots username
+        verify="YOUR_TELEGRAM_BOT",
+        # the url your bot should listen for messages
+        webhook_url="",
+    )
+
+    with pytest.raises(RasaException) as e:
+        rasa.core.run.configure_app([input_channel], port=5004)
+
+    assert "Failed to set channel webhook:" in str(e.value)
+
+
 async def test_handling_of_integer_user_id():
     # needed for telegram to work properly as this channel sends integer ids,
     # but we expect the sender_id to be a string everywhere else
@@ -389,6 +369,69 @@ def test_socketio_channel():
     assert routes_list["handle_request"].startswith("/socket.io")
 
 
+async def test_socketio_channel_jwt_authentication():
+    from rasa.core.channels.socketio import SocketIOInput
+
+    public_key = "random_key123"
+    jwt_algorithm = "HS256"
+    auth_token = jwt.encode({"payload": "value"}, public_key, algorithm=jwt_algorithm)
+
+    input_channel = SocketIOInput(
+        # event name for messages sent from the user
+        user_message_evt="user_uttered",
+        # event name for messages sent from the bot
+        bot_message_evt="bot_uttered",
+        # socket.io namespace to use for the messages
+        namespace=None,
+        # public key for JWT methods
+        jwt_key=public_key,
+        # method used for the signature of the JWT authentication payload
+        jwt_method=jwt_algorithm,
+    )
+
+    assert input_channel.jwt_key == public_key
+    assert input_channel.jwt_algorithm == jwt_algorithm
+    assert rasa.core.channels.channel.decode_bearer_token(
+        auth_token, input_channel.jwt_key, input_channel.jwt_algorithm
+    )
+
+
+async def test_socketio_channel_jwt_authentication_invalid_key(
+    caplog: LogCaptureFixture,
+):
+    from rasa.core.channels.socketio import SocketIOInput
+
+    public_key = "random_key123"
+    invalid_public_key = "my_invalid_key"
+    jwt_algorithm = "HS256"
+    invalid_auth_token = jwt.encode(
+        {"payload": "value"}, invalid_public_key, algorithm=jwt_algorithm
+    )
+
+    input_channel = SocketIOInput(
+        # event name for messages sent from the user
+        user_message_evt="user_uttered",
+        # event name for messages sent from the bot
+        bot_message_evt="bot_uttered",
+        # socket.io namespace to use for the messages
+        namespace=None,
+        # public key for JWT methods
+        jwt_key=public_key,
+        # method used for the signature of the JWT authentication payload
+        jwt_method=jwt_algorithm,
+    )
+
+    assert input_channel.jwt_key == public_key
+    assert input_channel.jwt_algorithm == jwt_algorithm
+
+    with caplog.at_level(logging.ERROR):
+        rasa.core.channels.channel.decode_bearer_token(
+            invalid_auth_token, input_channel.jwt_key, input_channel.jwt_algorithm
+        )
+
+    assert any("JWT public key invalid." in message for message in caplog.messages)
+
+
 async def test_callback_calls_endpoint():
     from rasa.core.channels.callback import CallbackOutput
 
@@ -420,7 +463,7 @@ async def test_callback_calls_endpoint():
 
 
 def test_botframework_attachments():
-    from rasa.core.channels.botframework import BotFrameworkInput, BotFramework
+    from rasa.core.channels.botframework import BotFrameworkInput
     from copy import deepcopy
 
     ch = BotFrameworkInput("app_id", "app_pass")
@@ -526,11 +569,13 @@ def test_register_channel_without_route():
 
     input_channel = RestInput()
 
-    app = Sanic(__name__)
+    app = Sanic("test_channels")
     rasa.core.channels.channel.register([input_channel], app, route=None)
 
     routes_list = utils.list_routes(app)
-    assert routes_list["custom_webhook_RestInput.receive"].startswith("/webhook")
+    assert routes_list["test_channels.custom_webhook_RestInput.receive"].startswith(
+        "/webhook"
+    )
 
 
 def test_channel_registration_with_absolute_url_prefix_overwrites_route():
@@ -541,7 +586,7 @@ def test_channel_registration_with_absolute_url_prefix_overwrites_route():
     test_route = "/absolute_route"
     input_channel.url_prefix = lambda: test_route
 
-    app = Sanic(__name__)
+    app = Sanic("test_channels")
     ignored_base_route = "/should_be_ignored"
     rasa.core.channels.channel.register(
         [input_channel], app, route="/should_be_ignored"
@@ -550,8 +595,12 @@ def test_channel_registration_with_absolute_url_prefix_overwrites_route():
     # Assure that an absolute url returned by `url_prefix` overwrites route parameter
     # given in `register`.
     routes_list = utils.list_routes(app)
-    assert routes_list["custom_webhook_RestInput.health"].startswith(test_route)
-    assert ignored_base_route not in routes_list.get("custom_webhook_RestInput.health")
+    assert routes_list["test_channels.custom_webhook_RestInput.health"].startswith(
+        test_route
+    )
+    assert ignored_base_route not in routes_list.get(
+        "test_channels.custom_webhook_RestInput.health"
+    )
 
 
 @pytest.mark.parametrize(
